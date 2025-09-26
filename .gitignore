@@ -1,0 +1,67 @@
+# Python字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook检查点
+.ipynb_checkpoints
+
+# PyTorch模型文件
+*.pth
+*.ckpt
+*.pt
+
+# 数据文件（大文件）
+data/raw/
+data/processed/
+*.csv
+*.xlsx
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# 实验结果（大文件）
+experiments/checkpoints/
+experiments/logs/*.log
+experiments/results/*.png
+experiments/results/*.pdf
+experiments/runs/
+
+# 机器学习相关
+mlruns/
+wandb/
+.mlflow/
+
+# IDE配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 环境配置文件
+.env
+.env.local
+.env.production
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+
+# 构建文件
+build/
+dist/
+*.egg-info/

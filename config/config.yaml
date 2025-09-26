@@ -1,0 +1,52 @@
+# DLFE-LSTM-WSI 主配置文件
+project:
+  name: "DLFE-LSTM-WSI"
+  version: "1.0.0"
+  device: "cuda:0"
+
+data:
+  dataset: "甘肃光伏功率预测数据集"
+  train_ratio: 0.7
+  val_ratio: 0.2
+  test_ratio: 0.1
+
+preprocessing:
+  vmd:
+    n_modes: 5          # VMD模态数q=5
+    alpha: 2000
+    tolerance: 1e-6
+  normalization:
+    method: "minmax"
+
+feature_engineering:
+  ci_thresholds: [0.2, 0.6]    # CI分类阈值
+  wsi_thresholds: [0.3, 0.7]   # WSI分类阈值
+  fusion_weights:              # 初始融合权重
+    ci: 0.7
+    wsi: 0.3
+  dpsr:
+    embedding_dim: 30          # DPSR嵌入维度M=30
+  dlfe:
+    target_dim: 30             # DLFE目标维度30维
+
+model:
+  lstm:
+    hidden_sizes: [100, 50]    # LSTM隐藏层大小
+    dropout_rates: [0.3, 0.2]  # Dropout比例
+
+training:
+  batch_size: 64
+  epochs: 100
+  learning_rate: 0.05
+  optimizer: "SGDM"
+
+adaptive:
+  error_window: 100           # 误差监控窗口
+  trigger_thresholds:         # 自适应触发阈值
+    level1: 0.1
+    level2: 0.15
+    level3: 0.05
+    level4: 5
+
+evaluation:
+  metrics: ["RMSE", "MAE", "NRMSE", "R2"]

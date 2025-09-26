@@ -1,0 +1,82 @@
+# DLFE-LSTM-WSI 数据配置文件
+
+# 数据集基础信息
+dataset:
+  name: "甘肃光伏功率预测数据集"
+  source: "Nature Scientific Data"
+  stations: 8                  # 8个站点数据
+  duration_years: 2            # 2年数据
+  sampling_frequency: "15min"  # 15分钟采样频率
+
+# 数据路径配置
+paths:
+  raw_data: "./data/raw"
+  processed_data: "./data/processed"
+  features_data: "./data/features"
+  splits_data: "./data/splits"
+
+# 数据字段定义
+features:
+  target_variable: "power"     # 目标变量：光伏功率
+  input_variables:
+    - "irradiance"             # 辐照度 (I)
+    - "temperature"            # 温度 (T)
+    - "pressure"               # 气压 (Pre)
+    - "humidity"               # 湿度 (Hum)
+
+# 数据预处理配置
+preprocessing:
+  missing_values:
+    strategy: "interpolation"  # 缺失值处理策略
+    method: "linear"           # 线性插值
+    max_consecutive: 6         # 最大连续缺失数
+
+  outlier_detection:
+    method: "iqr"              # 异常值检测方法
+    iqr_threshold: 1.5         # IQR阈值
+    apply_to: ["power", "irradiance"]
+
+  normalization:
+    method: "minmax"           # 归一化方法
+    feature_range: [0, 1]      # 归一化范围
+    apply_to_all: true
+
+# 数据划分配置
+data_splitting:
+  strategy: "temporal"         # 时序划分策略
+  train_ratio: 0.7            # 训练集比例
+  validation_ratio: 0.2       # 验证集比例
+  test_ratio: 0.1             # 测试集比例
+  shuffle: false              # 不打乱顺序（保持时序）
+
+# 时序窗口配置
+temporal_windows:
+  input_sequence_length: 144   # 输入序列长度（24小时×6个15分钟）
+  prediction_horizon: 6       # 预测时域（1.5小时）
+  stride: 1                   # 滑动窗口步长
+
+# 数据增强配置
+data_augmentation:
+  enable: false               # 是否启用数据增强
+  methods:
+    - "noise_injection"       # 噪声注入
+    - "time_warping"          # 时间扭曲
+
+# 数据质量控制
+quality_control:
+  power_range: [0, 1000]      # 功率合理范围 (kW)
+  irradiance_range: [0, 1200] # 辐照度合理范围 (W/m²)
+  temperature_range: [-20, 50] # 温度合理范围 (°C)
+  pressure_range: [900, 1100] # 气压合理范围 (hPa)
+  humidity_range: [0, 100]    # 湿度合理范围 (%)
+
+# 天气数据配置
+weather_features:
+  geographic_location:
+    latitude: 38.5            # 纬度（甘肃地区）
+    longitude: 105.0          # 经度（甘肃地区）
+    elevation: 1500           # 海拔高度 (m)
+
+  astronomical_parameters:
+    solar_constant: 1367      # 太阳常数 (W/m²)
+    time_zone: 8              # 时区（UTC+8）

@@ -1,0 +1,25 @@
+name: dlfe-lstm-wsi
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch>=1.12.0
+  - torchvision
+  - numpy>=1.21.0
+  - pandas>=1.3.0
+  - scikit-learn>=1.0.0
+  - matplotlib>=3.5.0
+  - seaborn>=0.11.0
+  - jupyter
+  - tensorboard
+  - pyyaml
+  - tqdm
+  - pip
+  - pip:
+    - PyWavelets>=1.3.0        # VMD变分模态分解
+    - statsmodels>=0.13.0      # 时序分析
+    - optuna>=3.0.0           # 超参数优化
+    - mlflow>=1.28.0          # 实验管理
+    - wandb>=0.13.0           # 实验追踪

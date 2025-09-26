@@ -1,0 +1,64 @@
+# DLFE-LSTM-WSI 模型配置文件
+
+# LSTM网络结构配置
+lstm:
+  architecture:
+    input_dim: 30              # 输入维度（DLFE降维后）
+    hidden_layers:
+      - units: 100             # 第一层LSTM单元数
+        dropout: 0.3           # 第一层Dropout比例
+        return_sequences: true
+      - units: 50              # 第二层LSTM单元数
+        dropout: 0.2           # 第二层Dropout比例
+        return_sequences: false
+    output_dim: 1              # 输出维度（单步预测）
+
+  activation:
+    gate_activation: "sigmoid" # 门控激活函数
+    state_activation: "tanh"   # 状态激活函数
+    output_activation: "sigmoid" # 输出激活函数
+
+# 多天气子模型配置
+multi_weather_models:
+  sunny:                       # 晴天子模型
+    model_id: "sunny_lstm"
+    weather_condition: "clear"
+    specialized_features: true
+
+  partly_cloudy:               # 部分多云子模型
+    model_id: "partly_cloudy_lstm"
+    weather_condition: "partly_cloudy"
+    specialized_features: true
+
+  overcast:                    # 阴天子模型
+    model_id: "overcast_lstm"
+    weather_condition: "overcast"
+    specialized_features: true
+
+# 损失函数配置
+loss:
+  primary_loss: "mse"          # 主要损失函数
+  auxiliary_loss: "mae"        # 辅助损失函数
+  loss_weights:
+    mse: 0.7
+    mae: 0.3
+
+# 优化器配置
+optimizer:
+  name: "SGD"
+  momentum: 0.9
+  weight_decay: 1e-4
+  nesterov: true
+
+# 学习率调度配置
+scheduler:
+  name: "StepLR"
+  step_size: 20
+  gamma: 0.5
+  min_lr: 1e-6
+
+# 正则化配置
+regularization:
+  l1_lambda: 1e-5
+  l2_lambda: 1e-4
+  gradient_clip: 5.0

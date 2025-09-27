@@ -10,7 +10,7 @@ dataset:
 
 # 数据路径配置
 paths:
-  raw_data: "./data/raw"
+  raw_data: "C:/Users/Administrator/桌面/专利/data/2. 甘肃光伏功率预测数据集/data_original/solar_stations"
   processed_data: "./data/processed"
   features_data: "./data/features"
   splits_data: "./data/splits"
@@ -34,7 +34,7 @@ preprocessing:
   outlier_detection:
     method: "iqr"              # 异常值检测方法
     iqr_threshold: 1.5         # IQR阈值
-    apply_to: ["power", "irradiance"]
+    apply_to: ["power", "irradiance", "temperature", "pressure", "humidity"]
 
   normalization:
     method: "minmax"           # 归一化方法
@@ -66,8 +66,8 @@ data_augmentation:
 quality_control:
   power_range: [0, 1000]      # 功率合理范围 (kW)
   irradiance_range: [0, 1200] # 辐照度合理范围 (W/m²)
-  temperature_range: [-20, 50] # 温度合理范围 (°C)
-  pressure_range: [900, 1100] # 气压合理范围 (hPa)
+  temperature_range: [-40, 60] # 温度合理范围 (°C)
+  pressure_range: [850, 1100] # 气压合理范围 (hPa)
   humidity_range: [0, 100]    # 湿度合理范围 (%)
 
 # 天气数据配置

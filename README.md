@@ -89,7 +89,17 @@ conda activate dlfe-lstm-wsi
 ```
 
 2. **数据准备**
-将甘肃光伏数据放置在 `data/raw/` 目录下
+
+- 原始“甘肃光伏功率预测数据集”位于 `C:/Users/Administrator/桌面/专利/data/2. 甘肃光伏功率预测数据集/data_original/solar_stations`
+- DataLoader 已支持 `.xlsx/.xls`，会自动识别 `Time(year-month-day h:m:s)` 为 `timestamp`
+- 关键列自动重命名：
+  - `Global horizontal irradiance (W/m2)` → `irradiance`
+  - `Air temperature (°C)` → `temperature`
+  - `Atmosphere (hpa)` → `pressure`
+  - `Relative humidity (%)` → `humidity`
+  - `Power (MW)` → `power`（自动转化为 kW）
+- 其余列仍保留，可按需在特征工程阶段使用
+- 如果换用其它目录，可在 `config/config.yaml` 或命令行参数中覆盖 `data.raw_dir`
 
 3. **配置修改**
 根据实际需求修改 `config/` 目录下的配置文件

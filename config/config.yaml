@@ -10,13 +10,14 @@ project:
 
 data:
   dataset: "甘肃光伏功率预测数据集"
+  raw_dir: "C:/Users/Administrator/桌面/专利/data/2. 甘肃光伏功率预测数据集/data_original/solar_stations"
   train_ratio: 0.7
   val_ratio: 0.2
   test_ratio: 0.1
   sequence_length: 24
-  frequency_minutes: 5
+  frequency_minutes: 15
   station_column: station
-  timestamp_column: datetime
+  timestamp_column: timestamp
   required_columns: [power, irradiance, temperature, pressure, humidity]
 
 preprocessing:

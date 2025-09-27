@@ -7,6 +7,7 @@ GPU优化：添加PyTorch DataLoader支持，实现GPU加速数据传输
 """
 
 import os
+import re
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
@@ -97,34 +98,25 @@ class DataLoader:
         logger.info(f"正在加载数据文件: {file_path}")
 
         try:
-            # 读取CSV文件
-            data = pd.read_csv(file_path, parse_dates=['timestamp'], index_col='timestamp')
+            suffix = file_path.suffix.lower()
+            if suffix in {'.csv', '.txt'}:
+                data = pd.read_csv(file_path)
+            elif suffix in {'.xlsx', '.xls'}:
+                data = pd.read_excel(file_path, sheet_name=0)
+            else:
+                raise ValueError(f"暂不支持的文件格式: {suffix}")
+
+            # 统一列名空白
+            data.columns = [re.sub(r"\s+", " ", str(col)).strip() for col in data.columns]
+
+            # 统一索引与列名
+            data = self._prepare_dataframe(data)
+            data = self._apply_column_mapping(data)
 
             # 检查必需列
             missing_cols = [col for col in self.required_columns if col not in data.columns]
             if missing_cols:
-                # 尝试列名映射（适应不同命名习惯）
-                column_mapping = {
-                    'P': 'power',
-                    'I': 'irradiance',
-                    'T': 'temperature',
-                    'Pre': 'pressure',
-                    'Hum': 'humidity'
-                }
-                data.rename(columns=column_mapping, inplace=True)
-
-                # 再次检查
-                missing_cols = [col for col in self.required_columns if col not in data.columns]
-                if missing_cols:
-                    raise ValueError(f"数据缺少必需列: {missing_cols}")
-
-            # 确保时间索引正确
-            if not isinstance(data.index, pd.DatetimeIndex):
-                logger.warning("时间索引格式不正确，尝试转换...")
-                data.index = pd.to_datetime(data.index)
-
-            # 按时间排序
-            data.sort_index(inplace=True)
+                raise ValueError(f"数据缺少必需列: {missing_cols}")
 
             # 数据完整性检查
             self._check_data_integrity(data)
@@ -135,6 +127,119 @@ class DataLoader:
         except Exception as e:
             logger.error(f"加载数据失败: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # 数据准备辅助函数
+    # ------------------------------------------------------------------
+
+    def _prepare_dataframe(self, data: pd.DataFrame) -> pd.DataFrame:
+        """统一处理时间列并设置索引"""
+
+        # 优先寻找标准列名
+        time_candidates = [
+            'timestamp',
+            'time',
+            'datetime',
+            'Time(year-month-day h:m:s)',
+            'Time (year-month-day h:m:s)',
+        ]
+
+        timestamp_col = None
+        for col in time_candidates:
+            if col in data.columns:
+                timestamp_col = col
+                break
+
+        if timestamp_col is None:
+            # 兜底：查找包含 time 的列
+            for col in data.columns:
+                if re.search(r'time', col, re.IGNORECASE):
+                    timestamp_col = col
+                    break
+
+        if timestamp_col is None:
+            raise ValueError("未找到时间列，请确保原始数据包含时间字段")
+
+        data = data.copy()
+        data.rename(columns={timestamp_col: 'timestamp'}, inplace=True)
+
+        # 解析索引
+        data['timestamp'] = pd.to_datetime(data['timestamp'])
+        data.set_index('timestamp', inplace=True)
+        data.sort_index(inplace=True)
+
+        return data
+
+    def _apply_column_mapping(self, data: pd.DataFrame) -> pd.DataFrame:
+        """将原始列映射为项目标准列名，并处理单位"""
+
+        column_mapping = {
+            'P': 'power',
+            'Power (MW)': 'power_mw',
+            'Power (kW)': 'power',
+            'power': 'power',
+            'I': 'irradiance',
+            'Global horizontal irradiance (W/m2)': 'irradiance',
+            'Total solar irradiance (W/m2)': 'irradiance_total',
+            'Direct normal irradiance (W/m2)': 'dni',
+            'Diffuse horizontal irradiance (W/m2)': 'dhi',
+            'Air temperature (°C)': 'temperature',
+            'Temperature (°C)': 'temperature',
+            'T': 'temperature',
+            'Atmosphere (hpa)': 'pressure',
+            'Atmospheric pressure (hPa)': 'pressure',
+            'Atmospheric pressure (kPa)': 'pressure_kpa',
+            'Pre': 'pressure',
+            'Relative humidity (%)': 'humidity',
+            'Humidity (%)': 'humidity',
+            'Hum': 'humidity',
+        }
+
+        renamed = {}
+        for col in data.columns:
+            key = column_mapping.get(col)
+            if key is None and isinstance(col, str):
+                key = column_mapping.get(col.strip())
+                if key is None:
+                    key = column_mapping.get(col.lower())
+            renamed[col] = key if key else col
+
+        data = data.rename(columns=renamed)
+
+        # 功率列统一为kW
+        if 'power' not in data.columns and 'power_mw' in data.columns:
+            data['power'] = data['power_mw'] * 1000.0
+        elif 'power' in data.columns and data['power'].max() <= 1.5:
+            data['power'] = data['power'] * 1000.0
+        elif 'power_kwh' in data.columns:
+            data['power'] = data['power_kwh']
+
+        # 辐照度优先使用GHI
+        if 'irradiance' not in data.columns:
+            if 'irradiance_total' in data.columns:
+                data['irradiance'] = data['irradiance_total']
+            elif 'dni' in data.columns:
+                data['irradiance'] = data['dni']
+            elif 'dhi' in data.columns:
+                data['irradiance'] = data['dhi']
+
+        if 'pressure' not in data.columns and 'pressure_kpa' in data.columns:
+            data['pressure'] = data['pressure_kpa'] * 10.0
+
+        # 统一湿度范围到0-100
+        if 'humidity' in data.columns:
+            data['humidity'] = data['humidity'].clip(lower=0, upper=100)
+
+        # 确保温度/气压/湿度存在
+        for required in ['temperature', 'pressure', 'humidity']:
+            if required not in data.columns:
+                raise ValueError(f"数据缺少必需列: {required}")
+
+        for col in ['power', 'irradiance', 'temperature', 'pressure', 'humidity']:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+
+        return data
 
     def load_multi_station(self, station_files: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
         """

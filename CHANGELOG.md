@@ -5,12 +5,31 @@
 ## [未发布] - 开发中
 
 ### 📋 待实现
-- [ ] 模型定义模块 (src/models/)
-- [ ] 训练模块 (src/training/)
-- [ ] 评估模块 (src/evaluation/)
-- [ ] 主程序集成 (scripts/)
-- [ ] 单元测试完善
+- [ ] 端到端真实数据回归测试
 - [ ] 性能基准测试
+- [ ] 推理服务化与部署方案
+
+## [0.4.0] - 2025-09-27 - 管线集成与评估增强
+
+### ✨ 新增功能
+- **统一主程序入口** (`main.py`)
+  - 集成 prepare/train/test 三种模式，贯通数据、特征、训练、评估流水线
+- **脚本对齐与实验自动化** (`scripts/`)
+  - `prepare_data.py`、`train_model.py`、`evaluate_model.py` 与 `run_experiment.sh` 统一调用主入口
+- **评估与可视化体系** (`src/evaluation/metrics.py`, `src/evaluation/visualizer.py`)
+  - 支持多时域与多天气指标、显著性检验，输出 Markdown 报告及全套图表
+- **GPU 优化训练组件** (`src/training/trainer.py`, `src/training/adaptive_optimizer.py`)
+  - 三天气模型并行训练、混合精度、自适应调度与监控脚本
+
+### 🔧 技术改进
+- 统一 `src/__init__.py`、`src/utils/`、`src/models/` 导出接口与配置加载
+- 数据处理链路新增缓存、持久化与天气标签贯通
+- `config/config.yaml`、环境脚本与依赖清单更新以匹配最新参数
+
+### 📚 文档与示例
+- 更新 `README.md` 补充执行命令、环境安装与数据格式
+- 新增 GPU 模块实现总结 (`docs/GPU_Models_Implementation_Summary.md`)
+- 新增 `examples/gpu_model_demo.py` 演示 GPU 模块使用
 
 ## [0.3.0] - 2025-09-26 - 特征工程模块
 

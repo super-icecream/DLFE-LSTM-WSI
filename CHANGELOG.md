@@ -10,11 +10,33 @@
 - [ ] 推理服务化与部署方案
 
 ### ✨ 新增功能
-- DataLoader 支持从甘肃原始数据目录直接读取 `.xlsx/.xls`，自动解析时间索引
+- **原始数据 Excel 适配** (`src/data_processing/data_loader.py`)
+  - 支持直接读取甘肃数据集 `data_original/solar_stations` 下的 `.xlsx/.xls`
+  - 自动解析 `Time(year-month-day h:m:s)` 为时间索引，兼容多站点加载
 
 ### 🔧 技术改进
-- 统一功率/辐照度/气压/湿度等列名与单位（功率 MW→kW，气压 kPa→hPa）
-- 调整数据质量检查与配置参数，增强异常值检测覆盖范围
+- 统一功率/辐照度/气压/湿度等列名与单位（功率 MW→kW，气压 kPa→hPa，湿度裁剪至 0-100）
+- 扩展异常值检测覆盖温度/气压/湿度，并调整合理范围配置
+- `config/config.yaml` / `config/data_config.yaml` 默认指向原始 Excel 目录，反映最新参数约束
+
+### 📚 文档与示例
+- 更新 `README.md` 的数据准备章节，补充 Excel 列映射、单位转换及路径配置说明
+
+## [0.4.1] - 2025-09-27
+- Commit: e81aba2c
+
+### ✨ 新增功能
+- **原始数据 Excel 适配** (`src/data_processing/data_loader.py`)
+  - 支持直接读取甘肃数据集 `data_original/solar_stations` 下的 `.xlsx/.xls`
+  - 自动解析 `Time(year-month-day h:m:s)` 为时间索引，兼容多站点加载
+
+### 🔧 技术改进
+- 统一功率/辐照度/气压/湿度等列名与单位（功率 MW→kW，气压 kPa→hPa，湿度裁剪至 0-100）
+- 扩展异常值检测覆盖温度/气压/湿度，并调整合理范围配置
+- `config/config.yaml` / `config/data_config.yaml` 默认指向原始 Excel 目录，反映最新参数约束
+
+### 📚 文档与示例
+- 更新 `README.md` 的数据准备章节，补充 Excel 列映射、单位转换及路径配置说明
 
 ## [0.4.0] - 2025-09-27 - 管线集成与评估增强
 

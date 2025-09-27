@@ -2,51 +2,84 @@
 project:
   name: "DLFE-LSTM-WSI"
   version: "1.0.0"
+  seed: 42
   device: "cuda:0"
+  log_dir: ./experiments/logs
+  checkpoint_dir: ./experiments/checkpoints
+  results_dir: ./experiments/results
 
 data:
   dataset: "甘肃光伏功率预测数据集"
   train_ratio: 0.7
   val_ratio: 0.2
   test_ratio: 0.1
+  sequence_length: 24
+  frequency_minutes: 5
+  station_column: station
+  timestamp_column: datetime
+  required_columns: [power, irradiance, temperature, pressure, humidity]
 
 preprocessing:
-  vmd:
-    n_modes: 5          # VMD模态数q=5
-    alpha: 2000
-    tolerance: 1e-6
+  caching: true
+  cache_dir: ./data/cache
   normalization:
-    method: "minmax"
+    method: minmax
+    feature_range: [0, 1]
+  vmd:
+    n_modes: 5
+    alpha: 2000
+    tolerance: 1.0e-6
+    max_iterations: 500
 
 feature_engineering:
-  ci_thresholds: [0.2, 0.6]    # CI分类阈值
-  wsi_thresholds: [0.3, 0.7]   # WSI分类阈值
-  fusion_weights:              # 初始融合权重
+  ci_thresholds: [0.2, 0.6]
+  wsi_thresholds: [0.3, 0.7]
+  fusion_weights:
     ci: 0.7
     wsi: 0.3
   dpsr:
-    embedding_dim: 30          # DPSR嵌入维度M=30
+    embedding_dim: 30
+    neighborhood_size: 20
+    regularization: 0.01
   dlfe:
-    target_dim: 30             # DLFE目标维度30维
+    target_dim: 30
+    sigma: 1.0
+    alpha: 0.0009765625
+    beta: 0.1
 
 model:
   lstm:
-    hidden_sizes: [100, 50]    # LSTM隐藏层大小
-    dropout_rates: [0.3, 0.2]  # Dropout比例
+    hidden_sizes: [100, 50]
+    dropout_rates: [0.3, 0.2]
+    output_dim: 1
 
 training:
   batch_size: 64
   epochs: 100
-  learning_rate: 0.05
-  optimizer: "SGDM"
+  learning_rate: 0.01
+  optimizer: adamw
+  weight_decay: 0.01
+  scheduler:
+    type: cosine
+    eta_min: 1.0e-6
+  gradient_accumulation_steps: 4
+  num_workers: 4
 
 adaptive:
-  error_window: 100           # 误差监控窗口
-  trigger_thresholds:         # 自适应触发阈值
+  error_window: 100
+  trigger_thresholds:
     level1: 0.1
     level2: 0.15
     level3: 0.05
     level4: 5
 
 evaluation:
-  metrics: ["RMSE", "MAE", "NRMSE", "R2"]
+  device: auto
+  horizons: [1, 3, 6]
+  metrics: [RMSE, MAE, NRMSE, R2, MAPE]
+  calculate_confidence: true
+  confidence_level: 0.95
+  n_bootstrap: 1000
+  save_results: true
+  generate_report: true
+  report_format: markdown

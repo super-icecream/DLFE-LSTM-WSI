@@ -1,6 +1,7 @@
 """
 数据加载模块
 功能：加载甘肃光伏功率预测数据集，处理时序数据，进行数据完整性检查
+GPU优化：添加PyTorch DataLoader支持，实现GPU加速数据传输
 作者：DLFE-LSTM-WSI Team
 日期：2025-09-26
 """
@@ -11,7 +12,10 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import logging
+import json
 import yaml
+import torch
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -43,6 +47,8 @@ class DataLoader:
         self.data_path = Path(data_path)
         self.required_columns = ['power', 'irradiance', 'temperature', 'pressure', 'humidity']
         self.freq = '15T'  # 15分钟采样频率
+        self.station_column = 'station'
+        self.frequency_minutes = 15
 
         # 加载配置文件
         if config_path:
@@ -196,6 +202,53 @@ class DataLoader:
 
         logger.info(f"数据合并完成，方法: {method}, 最终形状: {merged.shape}")
         return merged
+
+    def save_params(self, filepath: Union[str, Path]) -> None:
+        """保存DataLoader配置参数"""
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        params = {
+            'data_path': str(self.data_path),
+            'station_column': getattr(self, 'station_column', None),
+            'required_columns': self.required_columns,
+            'frequency_minutes': getattr(self, 'frequency_minutes', self.frequency_minutes),
+            'freq': self.freq,
+            'config': self.config,
+        }
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(params, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"DataLoader 参数已保存: {filepath}")
+
+    def load_params(self, filepath: Union[str, Path]) -> None:
+        """加载DataLoader配置参数"""
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"DataLoader 参数文件不存在: {filepath}")
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            params = json.load(f)
+
+        self.data_path = Path(params['data_path'])
+        self.station_column = params.get('station_column', getattr(self, 'station_column', None))
+        self.required_columns = params['required_columns']
+        self.optional_columns = params.get('optional_columns', getattr(self, 'optional_columns', []))
+        self.frequency_minutes = params.get('frequency_minutes', getattr(self, 'frequency_minutes', 15))
+        self.freq = params['freq']
+        self.config = params['config']
+
+        logger.info(f"DataLoader 参数已加载: {filepath}")
+
+    def load_processed_dataset(self, filepath: Union[str, Path]) -> pd.DataFrame:
+        """加载缓存的合并原始数据"""
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"缓存合并数据不存在: {filepath}")
+
+        logger.info(f"从缓存载入合并数据: {filepath}")
+        return pd.read_parquet(filepath)
 
     def _check_data_integrity(self, data: pd.DataFrame) -> Dict[str, any]:
         """
@@ -380,3 +433,220 @@ class DataLoader:
             logger.warning(f"数据质量问题: {quality_report['issues']}")
 
         return quality_report['pass'], quality_report
+
+    # ============ GPU优化功能扩展 ============
+
+    def create_sequence_data(self,
+                            features: np.ndarray,
+                            targets: np.ndarray,
+                            sequence_length: int = 24,
+                            weather_array: Optional[np.ndarray] = None
+                            ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """
+        创建序列数据用于LSTM训练
+
+        Args:
+            features: 特征数组 (n_timesteps, n_features)
+            targets: 目标数组 (n_timesteps,)
+            sequence_length: 序列长度
+            weather_array: 天气标签数组（可选，与features长度一致）
+
+        Returns:
+            Tuple: (序列特征, 序列目标[, 序列天气标签])
+        """
+        if weather_array is not None and len(weather_array) != len(features):
+            raise ValueError("weather_array 的长度必须与 features 一致")
+
+        n_samples = len(features) - sequence_length + 1
+
+        if n_samples <= 0:
+            if weather_array is not None:
+                return np.empty((0, sequence_length, features.shape[1])), np.empty((0, 1)), np.empty((0,), dtype=int)
+            return np.empty((0, sequence_length, features.shape[1])), np.empty((0, 1))
+
+        # 创建序列特征
+        X = np.zeros((n_samples, sequence_length, features.shape[1]))
+        y = np.zeros((n_samples, 1))
+        weather_seq = None
+        if weather_array is not None:
+            weather_seq = np.zeros((n_samples,), dtype=int)
+
+        for i in range(n_samples):
+            X[i] = features[i:i+sequence_length]
+            y[i] = targets[i+sequence_length-1]  # 预测最后一个时间步的目标
+            if weather_seq is not None:
+                weather_seq[i] = int(weather_array[i+sequence_length-1])
+
+        if weather_seq is not None:
+            return X, y, weather_seq
+        return X, y
+
+    def create_gpu_optimized_dataloader(self,
+                                       data: pd.DataFrame,
+                                       features_array: np.ndarray,
+                                       targets_array: np.ndarray,
+                                       batch_size: int = 64,
+                                       sequence_length: int = 24,
+                                       shuffle: bool = True,
+                                       is_training: bool = True,
+                                       weather_array: Optional[np.ndarray] = None) -> TorchDataLoader:
+        """
+        创建GPU优化的PyTorch DataLoader
+        严格按照指导文件第735-746行配置
+
+        Args:
+            data: 原始数据框（用于验证）
+            features_array: 特征数组
+            targets_array: 目标数组
+            batch_size: 批大小
+            sequence_length: 序列长度
+            shuffle: 是否打乱数据
+            is_training: 是否为训练模式
+            weather_array: 天气标签数组（可选）
+
+        Returns:
+            TorchDataLoader: GPU优化的数据加载器
+        """
+        # 创建序列数据
+        seq_result = self.create_sequence_data(
+            features_array,
+            targets_array,
+            sequence_length,
+            weather_array=weather_array
+        )
+
+        if weather_array is not None:
+            X, y, weather_seq = seq_result
+        else:
+            X, y = seq_result
+            weather_seq = None
+
+        # 创建PyTorch数据集
+        dataset = DLFELSTMDataset(X, y, weather_seq)
+
+        # 检测GPU可用性
+        use_gpu = torch.cuda.is_available()
+
+        # GPU优化配置（严格按照指导文件第735-746行）
+        if use_gpu:
+            if is_training:
+                # 训练数据加载器配置
+                dataloader = TorchDataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    num_workers=4,  # 多进程数据加载
+                    pin_memory=True,  # 固定内存，加速GPU传输
+                    persistent_workers=True,  # 保持worker进程
+                    prefetch_factor=2,  # 预取批次数
+                    drop_last=True  # 丢弃不完整批次（保持批大小一致）
+                )
+            else:
+                # 验证/测试数据加载器配置
+                dataloader = TorchDataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=4,
+                    pin_memory=True,
+                    persistent_workers=True,
+                    prefetch_factor=2,
+                    drop_last=False  # 验证时保留所有数据
+                )
+        else:
+            # CPU配置
+            dataloader = TorchDataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=2,
+                pin_memory=False,
+                drop_last=(True if is_training else False)
+            )
+
+        logger.info(f"创建{'GPU' if use_gpu else 'CPU'}优化DataLoader，批大小: {batch_size}")
+        return dataloader
+
+    def get_optimal_batch_size(self, gpu_id: int = 0) -> int:
+        """
+        根据GPU内存自动推荐最优批大小
+
+        Args:
+            gpu_id: GPU设备ID
+
+        Returns:
+            int: 推荐的批大小
+        """
+        if not torch.cuda.is_available():
+            return 32
+
+        # 获取GPU内存（GB）
+        gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3)
+
+        # 根据内存大小推荐批大小
+        if gpu_memory >= 16:  # 16GB+
+            optimal_batch_size = 256
+        elif gpu_memory >= 8:  # 8GB+
+            optimal_batch_size = 128
+        elif gpu_memory >= 4:  # 4GB+
+            optimal_batch_size = 64
+        else:
+            optimal_batch_size = 32
+
+        logger.info(f"GPU {gpu_id} 内存: {gpu_memory:.1f}GB, 推荐批大小: {optimal_batch_size}")
+        return optimal_batch_size
+
+
+class DLFELSTMDataset(Dataset):
+    """
+    DLFE-LSTM-WSI PyTorch数据集类
+    用于GPU加速的数据加载
+    """
+
+    def __init__(self,
+                 features: np.ndarray,
+                 targets: np.ndarray,
+                 weather: Optional[np.ndarray] = None,
+                 transform=None):
+        """
+        初始化数据集
+
+        Args:
+            features: 特征数组 (n_samples, seq_len, n_features)
+            targets: 目标数组 (n_samples, 1)
+            weather: 天气标签 (n_samples,) 可选
+            transform: 数据变换函数
+        """
+        self.features = torch.FloatTensor(features)
+        self.targets = torch.FloatTensor(targets)
+        if weather is not None:
+            self.weather = torch.as_tensor(weather, dtype=torch.long)
+        else:
+            self.weather = None
+        self.transform = transform
+
+        # 验证数据维度
+        assert len(self.features) == len(self.targets), "特征和目标数量不匹配"
+        if self.weather is not None:
+            assert len(self.weather) == len(self.targets), "天气标签数量与样本数量不匹配"
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        """
+        获取单个样本
+
+        Returns:
+            tuple: (features, targets)
+        """
+        features = self.features[idx]
+        targets = self.targets[idx]
+
+        if self.transform:
+            features = self.transform(features)
+
+        if self.weather is not None:
+            weather = self.weather[idx]
+            return features, targets, weather
+        return features, targets

@@ -56,6 +56,12 @@ Thumbs.db
 .env.local
 .env.production
 
+# 环境管理目录
+envs/backups/
+envs/locks/
+*.conda
+*.tar.gz
+
 # 临时文件
 *.tmp
 *.temp

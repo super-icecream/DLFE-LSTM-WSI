@@ -72,6 +72,7 @@ class DataSplitter:
             'seed': seed,
             'created_at': datetime.now().isoformat()
         }
+        self._splits: Optional[Dict[str, pd.DataFrame]] = None
 
         logger.info(f"数据划分器初始化: 训练集{train_ratio:.0%}, "
                    f"验证集{val_ratio:.0%}, 测试集{test_ratio:.0%}")
@@ -109,18 +110,22 @@ class DataSplitter:
         logger.info(f"时间范围: {data_sorted.index[0]} 至 {data_sorted.index[-1]}")
 
         if gap_hours > 0 and keep_continuity:
-            # 考虑时间间隔的划分
             train_data, val_data, test_data = self._split_with_gap(
                 data_sorted, gap_hours
             )
         else:
-            # 简单按比例划分
             train_end_idx = int(total_samples * self.train_ratio)
             val_end_idx = int(total_samples * (self.train_ratio + self.val_ratio))
 
             train_data = data_sorted.iloc[:train_end_idx]
             val_data = data_sorted.iloc[train_end_idx:val_end_idx]
             test_data = data_sorted.iloc[val_end_idx:]
+
+        self._splits = {
+            'train': train_data,
+            'val': val_data,
+            'test': test_data,
+        }
 
         # 更新划分信息
         self.split_info.update({
@@ -189,6 +194,10 @@ class DataSplitter:
         test_data = data.iloc[test_start_idx:]
 
         return train_data, val_data, test_data
+
+    def get_last_split(self) -> Optional[Dict[str, pd.DataFrame]]:
+        """返回最近一次 split_temporal 结果"""
+        return getattr(self, '_last_split', None)
 
     def split_by_station(self, data: pd.DataFrame,
                         station_column: str = 'station') -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
@@ -365,6 +374,7 @@ class DataSplitter:
             raise ValueError(f"不支持的文件格式: {info_path.suffix}")
 
         self.split_info = split_info
+        self._splits = None
         logger.info(f"已加载划分信息: {info_path}")
 
         return split_info
@@ -372,36 +382,47 @@ class DataSplitter:
     def save_splits(self, train: pd.DataFrame,
                    val: pd.DataFrame,
                    test: pd.DataFrame,
-                   output_dir: Union[str, Path]) -> None:
-        """
-        保存划分后的数据集到文件
-
-        Args:
-            train: 训练集
-            val: 验证集
-            test: 测试集
-            output_dir: 输出目录
-        """
+                   output_dir: Union[str, Path],
+                   formats: Optional[List[str]] = None,
+                   include_metadata: bool = True) -> None:
+        """保存划分后的数据集"""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 保存数据集
-        train_path = output_dir / "train.csv"
-        val_path = output_dir / "val.csv"
-        test_path = output_dir / "test.csv"
+        if formats is None:
+            formats = ['parquet']
 
-        train.to_csv(train_path)
-        val.to_csv(val_path)
-        test.to_csv(test_path)
+        # always retain splits in memory
+        self._splits = {'train': train, 'val': val, 'test': test}
 
-        # 保存划分信息
+        def _save(df: pd.DataFrame, name: str) -> None:
+            if 'csv' in formats:
+                df.to_csv(output_dir / f"{name}.csv")
+            if 'parquet' in formats:
+                df.to_parquet(output_dir / f"{name}.parquet")
+
+        _save(train, 'train')
+        _save(val, 'val')
+        _save(test, 'test')
+
+        if include_metadata:
+            metadata = {
+                'train_samples': len(train),
+                'val_samples': len(val),
+                'test_samples': len(test),
+                'train_time_range': [str(train.index.min()), str(train.index.max())],
+                'val_time_range': [str(val.index.min()), str(val.index.max())],
+                'test_time_range': [str(test.index.min()), str(test.index.max())],
+                'created_at': datetime.now().isoformat()
+            }
+            with open(output_dir / 'split_metadata.json', 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            logger.info("划分元信息已保存: %s", output_dir / 'split_metadata.json')
+
         info_path = output_dir / "split_info.json"
         self.save_split_info(info_path)
 
-        logger.info(f"数据集已保存至: {output_dir}")
-        logger.info(f"  训练集: {train_path}")
-        logger.info(f"  验证集: {val_path}")
-        logger.info(f"  测试集: {test_path}")
+        logger.info("数据集已保存至 %s (格式: %s)", output_dir, ','.join(formats))
 
     def get_split_statistics(self, train: pd.DataFrame,
                             val: pd.DataFrame,

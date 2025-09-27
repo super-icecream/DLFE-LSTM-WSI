@@ -524,12 +524,14 @@ class DPSR:
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
+        splits = getattr(self, 'last_split_sizes', {})
         weights_data = {
             'global_weights': self.global_weights.tolist(),
             'time_weights': {int(k): v.tolist() for k, v in self.weights.items()},
             'embedding_dim': self.embedding_dim,
             'neighborhood_size': self.neighborhood_size,
-            'regularization': self.regularization
+            'regularization': self.regularization,
+            'split_sizes': splits
         }
 
         if filepath.suffix == '.json':
@@ -570,6 +572,7 @@ class DPSR:
         self.neighborhood_size = weights_data['neighborhood_size']
         self.regularization = weights_data['regularization']
         self.is_fitted = True
+        self.last_split_sizes = weights_data.get('split_sizes', {})
 
         logger.info(f"DPSR权重已加载: {filepath}")
 

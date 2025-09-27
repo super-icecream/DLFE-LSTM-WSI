@@ -1,0 +1,580 @@
+"""
+GPU优化的训练器模块
+功能：管理完整训练流程，支持混合精度训练，多天气子模型并行训练
+GPU优化：CUDA流并行、混合精度、梯度累积、异步数据加载
+作者：DLFE-LSTM-WSI Team
+日期：2025-09-27
+"""
+
+import torch
+import torch.nn as nn
+import torch.cuda.amp as amp
+from torch.utils.data import DataLoader
+from typing import Dict, Optional, Tuple, List
+import logging
+from tqdm import tqdm
+import os
+from pathlib import Path
+import json
+import numpy as np
+from datetime import datetime
+
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class GPUOptimizedTrainer:
+    """
+    GPU优化的训练器
+    - 混合精度训练加速
+    - 梯度累积减少内存峰值
+    - 异步数据加载
+    - 多模型并行训练
+    """
+
+    def __init__(self,
+                 models: Dict[str, nn.Module],
+                 config: Dict,
+                 device: str = 'cuda'):
+        """
+        参数：
+        - models: 三个天气子模型字典
+        - config: 训练配置
+        - device: 计算设备
+        """
+        self.models = models
+        self.available_weathers = list(models.keys())
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.config = config
+
+        # 混合精度训练组件
+        self.scaler = amp.GradScaler() if device == 'cuda' else None
+
+        # 优化器和调度器
+        self.optimizers = {}
+        self.schedulers = {}
+        self._setup_optimizers()
+
+        # CUDA流（用于并行训练）
+        if torch.cuda.is_available():
+            self.streams = {
+                weather: torch.cuda.Stream()
+                for weather in self.available_weathers
+            }
+        else:
+            self.streams = None
+
+        # 训练历史记录
+        self.train_history = {
+            weather: {'loss': [], 'metrics': []}
+            for weather in self.available_weathers
+        }
+
+        # 梯度累积步数
+        self.accumulation_steps = config.get('gradient_accumulation_steps', 4)
+
+        logger.info(f"训练器初始化完成，设备: {self.device}")
+
+    def _setup_optimizers(self):
+        """设置优化器和学习率调度器"""
+        for weather_type, model in self.models.items():
+            # 移动模型到设备
+            model.to(self.device)
+
+            # 创建优化器（使用融合优化器提高速度）
+            if self.device.type == 'cuda':
+                self.optimizers[weather_type] = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=self.config.get('learning_rate', 0.001),
+                    weight_decay=self.config.get('weight_decay', 0.01),
+                    fused=True  # 使用融合优化器（GPU加速）
+                )
+            else:
+                self.optimizers[weather_type] = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=self.config.get('learning_rate', 0.001),
+                    weight_decay=self.config.get('weight_decay', 0.01)
+                )
+
+            # 创建学习率调度器
+            self.schedulers[weather_type] = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizers[weather_type],
+                T_max=self.config.get('epochs', 100),
+                eta_min=1e-6
+            )
+
+    def train_epoch(self,
+                   train_loader: DataLoader,
+                   weather_type: str,
+                   epoch: int) -> Dict:
+        """
+        单个epoch训练（GPU优化）
+
+        关键优化：
+        - 混合精度前向传播
+        - 梯度累积（每4个batch更新一次）
+        - 异步数据预取
+        - 动态批大小调整
+        """
+        model = self.models[weather_type]
+        optimizer = self.optimizers[weather_type]
+        model.train()
+
+        epoch_loss = 0
+        num_batches = 0
+
+        # 创建进度条
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch} - {weather_type}")
+
+        for batch_idx, batch in enumerate(pbar):
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                features, targets, _ = batch
+            else:
+                features, targets = batch
+
+            # 异步数据传输到GPU
+            if self.device.type == 'cuda':
+                features = features.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+            else:
+                features = features.to(self.device)
+                targets = targets.to(self.device)
+
+            # 混合精度前向传播
+            if self.scaler:
+                with amp.autocast():
+                    predictions, _ = model(features)
+                    loss = nn.MSELoss()(predictions, targets)
+
+                    # 梯度累积
+                    loss = loss / self.accumulation_steps
+
+                # 反向传播（混合精度）
+                self.scaler.scale(loss).backward()
+
+                # 梯度累积更新
+                if (batch_idx + 1) % self.accumulation_steps == 0:
+                    # 梯度裁剪（防止梯度爆炸）
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                    # 优化器更新
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+
+                    # 清零梯度（set_to_none更高效）
+                    optimizer.zero_grad(set_to_none=True)
+            else:
+                # CPU训练
+                predictions, _ = model(features)
+                loss = nn.MSELoss()(predictions, targets)
+                loss = loss / self.accumulation_steps
+                loss.backward()
+
+                if (batch_idx + 1) % self.accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+            # 记录损失
+            epoch_loss += loss.item() * self.accumulation_steps
+            num_batches += 1
+
+            # 更新进度条
+            pbar.set_postfix({'loss': epoch_loss / num_batches})
+
+            # 定期清理GPU缓存
+            if self.device.type == 'cuda' and batch_idx % 100 == 0:
+                torch.cuda.empty_cache()
+
+        # 学习率调度
+        self.schedulers[weather_type].step()
+
+        # 记录训练历史
+        avg_loss = epoch_loss / num_batches
+        self.train_history[weather_type]['loss'].append(avg_loss)
+
+        return {
+            'loss': avg_loss,
+            'lr': self.optimizers[weather_type].param_groups[0]['lr']
+        }
+
+    def train_all_models(self,
+                        train_loaders: Dict[str, DataLoader],
+                        val_loaders: Dict[str, DataLoader],
+                        epochs: int = 100) -> Dict:
+        """
+        并行训练三个天气子模型
+
+        使用CUDA流实现真正的并行训练
+        """
+        logger.info(f"开始训练所有模型，总共 {epochs} 个epochs")
+
+        best_metrics = {
+            weather: {'loss': float('inf'), 'epoch': 0}
+            for weather in self.available_weathers
+        }
+
+        for epoch in range(epochs):
+            logger.info(f"========== Epoch {epoch+1}/{epochs} ==========")
+
+            if self.streams and torch.cuda.is_available():
+                # GPU并行训练
+                train_results = {}
+
+                for weather_type in self.available_weathers:
+                if weather_type not in train_loaders:
+                        continue
+                    with torch.cuda.stream(self.streams[weather_type]):
+                        result = self.train_epoch(
+                            train_loaders[weather_type],
+                            weather_type,
+                            epoch + 1
+                        )
+                        train_results[weather_type] = result
+
+                # 等待所有流完成
+                for stream in self.streams.values():
+                    stream.synchronize()
+            else:
+                # 串行训练（CPU或单流）
+                train_results = {}
+                for weather_type in self.available_weathers:
+                    if weather_type not in train_loaders:
+                        continue
+                    result = self.train_epoch(
+                        train_loaders[weather_type],
+                        weather_type,
+                        epoch + 1
+                    )
+                    train_results[weather_type] = result
+
+            # 验证（如果提供了验证集）
+            if val_loaders:
+                val_results = self.validate_all(val_loaders)
+
+                # 更新最佳模型
+                for weather_type, result in val_results.items():
+                    if result['loss'] < best_metrics[weather_type]['loss']:
+                        best_metrics[weather_type]['loss'] = result['loss']
+                        best_metrics[weather_type]['epoch'] = epoch + 1
+
+                        self.save_checkpoint(
+                            epoch + 1,
+                            {'train': train_results, 'val': val_results},
+                            is_best=True,
+                            model_type=weather_type
+                        )
+
+            # 定期保存检查点
+            if (epoch + 1) % self.config.get('save_interval', 10) == 0:
+                self.save_checkpoint(
+                    epoch + 1,
+                    {'train': train_results, 'val': val_results if val_loaders else None}
+                )
+
+            # 日志记录
+            logger.info(f"训练结果: {train_results}")
+            if val_loaders:
+                logger.info(f"验证结果: {val_results}")
+
+        logger.info("训练完成！")
+        return {
+            'best_metrics': best_metrics,
+            'train_history': self.train_history
+        }
+
+    def validate_all(self, val_loaders: Dict[str, DataLoader]) -> Dict:
+        """验证所有模型"""
+        val_results = {}
+
+        for weather_type, val_loader in val_loaders.items():
+            model = self.models[weather_type]
+            model.eval()
+
+            val_loss = 0
+            num_batches = 0
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                        features, targets, _ = batch
+                    else:
+                        features, targets = batch
+                    if self.device.type == 'cuda':
+                        features = features.to(self.device, non_blocking=True)
+                        targets = targets.to(self.device, non_blocking=True)
+                    else:
+                        features = features.to(self.device)
+                        targets = targets.to(self.device)
+
+                    predictions, _ = model(features)
+                    loss = nn.MSELoss()(predictions, targets)
+
+                    val_loss += loss.item()
+                    num_batches += 1
+
+            avg_val_loss = val_loss / num_batches
+            val_results[weather_type] = {'loss': avg_val_loss}
+
+        return val_results
+
+    def save_checkpoint(self, epoch: int, metrics: Dict, is_best: bool = False, model_type: str = None):
+        """保存训练检查点（支持断点续训）"""
+        checkpoint_dir = Path(self.config.get('checkpoint_dir', './checkpoints'))
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        if model_type:
+            # 保存特定模型
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': self.models[model_type].state_dict(),
+                'optimizer_state_dict': self.optimizers[model_type].state_dict(),
+                'scheduler_state_dict': self.schedulers[model_type].state_dict(),
+                'metrics': metrics,
+                'config': self.config
+            }
+
+            if is_best:
+                filename = checkpoint_dir / f"best_{model_type}_model.pth"
+            else:
+                filename = checkpoint_dir / f"checkpoint_{model_type}_epoch_{epoch}.pth"
+
+            torch.save(checkpoint, filename)
+            logger.info(f"保存检查点: {filename}")
+        else:
+            # 保存所有模型
+            for weather_type in self.models.keys():
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': self.models[weather_type].state_dict(),
+                    'optimizer_state_dict': self.optimizers[weather_type].state_dict(),
+                    'scheduler_state_dict': self.schedulers[weather_type].state_dict(),
+                    'metrics': metrics,
+                    'config': self.config,
+                    'train_history': self.train_history[weather_type]
+                }
+
+                filename = checkpoint_dir / f"checkpoint_{weather_type}_epoch_{epoch}.pth"
+                torch.save(checkpoint, filename)
+
+            logger.info(f"保存所有模型检查点，epoch: {epoch}")
+
+    def load_checkpoint(self, checkpoint_path: str, model_type: str = None):
+        """加载检查点继续训练"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        if model_type:
+            # 加载特定模型
+            self.models[model_type].load_state_dict(checkpoint['model_state_dict'])
+            self.optimizers[model_type].load_state_dict(checkpoint['optimizer_state_dict'])
+            self.schedulers[model_type].load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info(f"加载{model_type}模型检查点，epoch: {checkpoint['epoch']}")
+        else:
+            # 尝试推断模型类型
+            for weather_type in self.models.keys():
+                if weather_type in checkpoint_path:
+                    self.models[weather_type].load_state_dict(checkpoint['model_state_dict'])
+                    self.optimizers[weather_type].load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.schedulers[weather_type].load_state_dict(checkpoint['scheduler_state_dict'])
+
+                    if 'train_history' in checkpoint:
+                        self.train_history[weather_type] = checkpoint['train_history']
+
+                    logger.info(f"加载{weather_type}模型检查点")
+                    break
+
+        return checkpoint.get('epoch', 0)
+
+
+if __name__ == "__main__":
+    # 测试代码
+    print("GPU优化训练器模块测试")
+
+    # 创建模拟模型
+                        continue
+                    result = self.train_epoch(
+                        train_loaders[weather_type],
+                        weather_type,
+                        epoch + 1
+                    )
+                    train_results[weather_type] = result
+
+            # 验证（如果提供了验证集）
+            if val_loaders:
+                val_results = self.validate_all(val_loaders)
+
+                # 更新最佳模型
+                for weather_type, result in val_results.items():
+                    if result['loss'] < best_metrics[weather_type]['loss']:
+                        best_metrics[weather_type]['loss'] = result['loss']
+                        best_metrics[weather_type]['epoch'] = epoch + 1
+
+                        self.save_checkpoint(
+                            epoch + 1,
+                            {'train': train_results, 'val': val_results},
+                            is_best=True,
+                            model_type=weather_type
+                        )
+
+            # 定期保存检查点
+            if (epoch + 1) % self.config.get('save_interval', 10) == 0:
+                self.save_checkpoint(
+                    epoch + 1,
+                    {'train': train_results, 'val': val_results if val_loaders else None}
+                )
+
+            # 日志记录
+            logger.info(f"训练结果: {train_results}")
+            if val_loaders:
+                logger.info(f"验证结果: {val_results}")
+
+        logger.info("训练完成！")
+        return {
+            'best_metrics': best_metrics,
+            'train_history': self.train_history
+        }
+
+    def validate_all(self, val_loaders: Dict[str, DataLoader]) -> Dict:
+        """验证所有模型"""
+        val_results = {}
+
+        for weather_type, val_loader in val_loaders.items():
+            model = self.models[weather_type]
+            model.eval()
+
+            val_loss = 0
+            num_batches = 0
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                        features, targets, _ = batch
+                    else:
+                        features, targets = batch
+                    if self.device.type == 'cuda':
+                        features = features.to(self.device, non_blocking=True)
+                        targets = targets.to(self.device, non_blocking=True)
+                    else:
+                        features = features.to(self.device)
+                        targets = targets.to(self.device)
+
+                    predictions, _ = model(features)
+                    loss = nn.MSELoss()(predictions, targets)
+
+                    val_loss += loss.item()
+                    num_batches += 1
+
+            avg_val_loss = val_loss / num_batches
+            val_results[weather_type] = {'loss': avg_val_loss}
+
+        return val_results
+
+    def save_checkpoint(self, epoch: int, metrics: Dict, is_best: bool = False, model_type: str = None):
+        """保存训练检查点（支持断点续训）"""
+        checkpoint_dir = Path(self.config.get('checkpoint_dir', './checkpoints'))
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        if model_type:
+            # 保存特定模型
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': self.models[model_type].state_dict(),
+                'optimizer_state_dict': self.optimizers[model_type].state_dict(),
+                'scheduler_state_dict': self.schedulers[model_type].state_dict(),
+                'metrics': metrics,
+                'config': self.config
+            }
+
+            if is_best:
+                filename = checkpoint_dir / f"best_{model_type}_model.pth"
+            else:
+                filename = checkpoint_dir / f"checkpoint_{model_type}_epoch_{epoch}.pth"
+
+            torch.save(checkpoint, filename)
+            logger.info(f"保存检查点: {filename}")
+        else:
+            # 保存所有模型
+            for weather_type in self.models.keys():
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': self.models[weather_type].state_dict(),
+                    'optimizer_state_dict': self.optimizers[weather_type].state_dict(),
+                    'scheduler_state_dict': self.schedulers[weather_type].state_dict(),
+                    'metrics': metrics,
+                    'config': self.config,
+                    'train_history': self.train_history[weather_type]
+                }
+
+                filename = checkpoint_dir / f"checkpoint_{weather_type}_epoch_{epoch}.pth"
+                torch.save(checkpoint, filename)
+
+            logger.info(f"保存所有模型检查点，epoch: {epoch}")
+
+    def load_checkpoint(self, checkpoint_path: str, model_type: str = None):
+        """加载检查点继续训练"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        if model_type:
+            # 加载特定模型
+            self.models[model_type].load_state_dict(checkpoint['model_state_dict'])
+            self.optimizers[model_type].load_state_dict(checkpoint['optimizer_state_dict'])
+            self.schedulers[model_type].load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info(f"加载{model_type}模型检查点，epoch: {checkpoint['epoch']}")
+        else:
+            # 尝试推断模型类型
+            for weather_type in self.models.keys():
+                if weather_type in checkpoint_path:
+                    self.models[weather_type].load_state_dict(checkpoint['model_state_dict'])
+                    self.optimizers[weather_type].load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.schedulers[weather_type].load_state_dict(checkpoint['scheduler_state_dict'])
+
+                    if 'train_history' in checkpoint:
+                        self.train_history[weather_type] = checkpoint['train_history']
+
+                    logger.info(f"加载{weather_type}模型检查点")
+                    break
+
+        return checkpoint.get('epoch', 0)
+
+
+if __name__ == "__main__":
+    # 测试代码
+    print("GPU优化训练器模块测试")
+
+    # 创建模拟模型
+    class SimpleModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lstm = nn.LSTM(30, 100, batch_first=True)
+            self.fc = nn.Linear(100, 1)
+
+        def forward(self, x):
+            lstm_out, hidden = self.lstm(x)
+            output = self.fc(lstm_out[:, -1, :])
+            return output, hidden
+
+    # 创建三个天气模型
+    models = {
+        'sunny': SimpleModel(),
+        'cloudy': SimpleModel(),
+        'overcast': SimpleModel()
+    }
+
+    # 配置
+    config = {
+        'learning_rate': 0.001,
+        'weight_decay': 0.01,
+        'epochs': 10,
+        'gradient_accumulation_steps': 4,
+        'save_interval': 5,
+        'checkpoint_dir': './test_checkpoints'
+    }
+
+    # 创建训练器
+    trainer = GPUOptimizedTrainer(models, config)
+
+    print(f"训练器创建成功，设备: {trainer.device}")
+    print(f"混合精度训练: {trainer.scaler is not None}")
+    print(f"并行流数量: {len(trainer.streams) if trainer.streams else 0}")

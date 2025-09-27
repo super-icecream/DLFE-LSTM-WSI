@@ -82,7 +82,9 @@ DLFE-LSTM-WSI/
 1. **环境安装**
 ```bash
 cd environment
-conda env create -f environment.yml
+bash setup_env.sh            # 默认安装GPU版本
+# 或者 CPU 环境
+bash setup_env.sh --cpu
 conda activate dlfe-lstm-wsi
 ```
 
@@ -92,9 +94,16 @@ conda activate dlfe-lstm-wsi
 3. **配置修改**
 根据实际需求修改 `config/` 目录下的配置文件
 
-4. **运行训练**
+4. **运行训练 / 评估**
 ```bash
-python scripts/train.py --config config/config.yaml
+python main.py prepare --run-name demo
+python main.py train --run-name demo
+python main.py test --run-name demo
+
+# 或使用脚本包装
+python scripts/prepare_data.py --run-name demo
+python scripts/train_model.py --run-name demo
+python scripts/evaluate_model.py --run-name demo
 ```
 
 ## 数据格式

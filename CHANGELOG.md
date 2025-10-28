@@ -1,13 +1,48 @@
 # 更新日志
 
-本文档记录DLFE-LSTM-WSI项目的所有重要变更。
+本文档记录DLFE-LSTM-WSI项目的所有重要变更和git id方便回溯。
 
-## [未发布] - 开发中
+## [0.4.2] - 2025-10-28 - 物理约束异常检测 + 日志系统修复
 
-### 📋 待实现
-- [ ] 端到端真实数据回归测试
-- [ ] 性能基准测试
-- [ ] 推理服务化与部署方案
+### ✨ 新增功能
+- **基于物理约束的异常值检测** (`src/data_processing/data_loader.py`)
+  - 从统计方法（IQR/Z-score）升级为基于领域知识的物理约束方法
+  - 定义五类变量的物理范围：power[0,55000]kW, irradiance[0,1200]W/m², temperature[-40,60]°C, pressure[850,1100]hPa, humidity[0,100]%
+  - 区分错误标记值（-99/-999/-9999）和真实物理异常
+  - 支持三种检测方法：`physical`（推荐）/ `iqr` / `zscore`
+  
+- **智能配置合并机制** (`src/data_processing/data_loader.py`)
+  - 从 `data_config.yaml` 智能加载预处理配置
+  - 自动合并默认配置和文件配置
+  - 向后兼容旧版配置结构
+
+### 🔧 技术改进
+- **日志系统兼容性修复** (`src/utils/logger.py`)
+  - 修复 `ExperimentLogger` 不支持标准 Python logging 的 `%` 格式化问题
+  - 解决 `TypeError: info() takes 2 positional arguments but 3 were given`
+  - 完全兼容 `logger.info("msg %s", value)` 语法
+  - 保持异步日志、GPU监控等高级特性不变
+
+- **配置系统优化** (`config/data_config.yaml`)
+  - 新增 `physical_ranges` 配置项，定义各变量的物理约束范围
+  - 新增 `error_markers` 配置项，明确错误标记值
+  - 异常检测方法改为 `physical`，基于光伏和气象学领域知识
+  - 保留 `iqr` / `zscore` 作为备选方案
+
+### 📚 文档与示例
+- **新增完整方案文档** (`docs/物理约束异常检测方案.md`)
+  - 详细说明统计方法的局限性和物理约束方法的优势
+  - 提供科学依据：太阳辐照度标准、光伏系统设计规范、气象数据标准
+  - 包含对比分析、使用指南和维护建议
+  - 示例说明如何根据不同站点调整物理范围
+
+### 🎯 影响与效果
+- **减少误判率**：正常峰值（如989 W/m²辐照度、48MW功率）不再被错误标记
+- **提高数据利用率**：更多物理合理的数据可用于模型训练
+- **增强可解释性**：每个阈值都有明确的物理意义和科学依据
+- **灵活适配性**：通过配置文件轻松适配不同站点和装机容量
+
+## [0.4.1] - 2025-09-27
 
 ### ✨ 新增功能
 - **原始数据 Excel 适配** (`src/data_processing/data_loader.py`)
@@ -18,6 +53,7 @@
 - 统一功率/辐照度/气压/湿度等列名与单位（功率 MW→kW，气压 kPa→hPa，湿度裁剪至 0-100）
 - 扩展异常值检测覆盖温度/气压/湿度，并调整合理范围配置
 - `config/config.yaml` / `config/data_config.yaml` 默认指向原始 Excel 目录，反映最新参数约束
+- DataLoader 支持可选 `merge_method=single`，默认仅加载第一个站点；时间频率日志提示优化
 
 ### 📚 文档与示例
 - 更新 `README.md` 的数据准备章节，补充 Excel 列映射、单位转换及路径配置说明

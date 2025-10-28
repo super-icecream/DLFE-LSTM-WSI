@@ -249,34 +249,43 @@ class ExperimentLogger:
         self.log_thread = threading.Thread(target=async_log_worker, daemon=True)
         self.log_thread.start()
     
-    def debug(self, message: str, **kwargs):
+    def debug(self, message: str, *args, **kwargs):
         """DEBUG级别日志"""
-        self._log(logging.DEBUG, message, **kwargs)
+        self._log(logging.DEBUG, message, *args, **kwargs)
     
-    def info(self, message: str, **kwargs):
+    def info(self, message: str, *args, **kwargs):
         """INFO级别日志"""
-        self._log(logging.INFO, message, **kwargs)
+        self._log(logging.INFO, message, *args, **kwargs)
     
-    def warning(self, message: str, **kwargs):
+    def warning(self, message: str, *args, **kwargs):
         """WARNING级别日志"""
-        self._log(logging.WARNING, message, **kwargs)
+        self._log(logging.WARNING, message, *args, **kwargs)
     
-    def error(self, message: str, exc_info: bool = False, **kwargs):
+    def error(self, message: str, *args, exc_info: bool = False, **kwargs):
         """ERROR级别日志"""
         if exc_info:
             message += f"\n{traceback.format_exc()}"
-        self._log(logging.ERROR, message, **kwargs)
+        self._log(logging.ERROR, message, *args, **kwargs)
     
-    def critical(self, message: str, **kwargs):
+    def critical(self, message: str, *args, **kwargs):
         """CRITICAL级别日志"""
-        self._log(logging.CRITICAL, message, **kwargs)
+        self._log(logging.CRITICAL, message, *args, **kwargs)
     
-    def _log(self, level: int, message: str, **kwargs):
-        """内部日志方法"""
+    def _log(self, level: int, message: str, *args, **kwargs):
+        """内部日志方法
+        
+        支持标准Python logging格式化：
+        - logger.info("Message %s", value)  # 使用 % 格式化
+        - logger.info("Message", extra={'key': 'value'})  # 关键字参数
+        """
+        # 如果有格式化参数，先格式化消息
+        if args:
+            message = message % args
+        
         # 格式化额外参数
         if kwargs:
             extra_info = ' | '.join([f"{k}={v}" for k, v in kwargs.items()])
-            message = f"{message} | {extra_info}"
+            message = f"{message} | extra={{{extra_info}}}"
         
         if self.log_queue is not None:
             # 异步日志
@@ -399,19 +408,14 @@ class ExperimentLogger:
         self.info("实验日志已关闭")
 
 
-def get_logger(name: Optional[str] = None) -> ExperimentLogger:
-    """
-    获取全局日志器
-    
-    Args:
-        name: 日志器名称
-        
-    Returns:
-        ExperimentLogger实例
-    """
-    if name:
-        return ExperimentLogger(name=name)
-    return ExperimentLogger()
+def get_logger(name: Optional[str] = None, **kwargs) -> ExperimentLogger:
+    """获取全局日志器，支持自定义目录和设置"""
+    if name is None:
+        name = 'DLFE-LSTM-WSI'
+
+    log_dir = kwargs.pop('log_dir', './experiments/logs')
+    log_level = kwargs.pop('log_level', 'INFO')
+    return ExperimentLogger(name=name, log_dir=log_dir, log_level=log_level, **kwargs)
 
 
 # 单元测试

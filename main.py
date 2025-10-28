@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
 
     prepare_parser = subparsers.add_parser("prepare", help="仅构建并缓存特征")
     add_shared_arguments(prepare_parser)
+    prepare_parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="实验运行名称（默认使用时间戳）",
+    )
 
     train_parser = subparsers.add_parser("train", help="训练并评估模型")
     add_shared_arguments(train_parser)
@@ -202,13 +208,18 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
             merged = data_loader.load_processed_dataset(paths.processed / "merged.parquet")
             logger.info("已从缓存加载合并数据与DataLoader配置")
         except Exception as exc:
-            logger.warning("加载缓存的合并数据失败，将重新执行数据加载: %s", exc)
+            logger.warning(f"加载缓存的合并数据失败，将重新执行数据加载: {exc}")
             merged = None
     else:
         merged = None
 
     if merged is None:
-        station_data = data_loader.load_multi_station()
+        merge_method = config.get("data", {}).get("merge_method", "concat")
+        selected_station = config.get("data", {}).get("selected_station")
+        station_data = data_loader.load_multi_station(
+            merge_method=merge_method,
+            selected_station=selected_station,
+        )
         if not station_data:
             raise FileNotFoundError(f"原始数据目录 {paths.raw} 中未找到任何 CSV 数据文件")
 
@@ -216,15 +227,18 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
             merged = next(iter(station_data.values()))
             logger.info("检测到单站点数据，跳过合并阶段")
         else:
-            merge_method = config.get("data", {}).get("merge_method", "concat")
-            merged = data_loader.merge_stations(station_data, method=merge_method)
-            logger.info("多站点数据合并完成，采用方法 %s", merge_method)
+            if merge_method == "single":
+                merged = next(iter(station_data.values()))
+                logger.info("merge_method=single，默认使用第一个站点")
+            else:
+                merged = data_loader.merge_stations(station_data, method=merge_method)
+                logger.info(f"多站点数据合并完成，采用方法 {merge_method}")
 
         merged.sort_index(inplace=True)
         merged = data_loader.handle_missing_values(merged)
         passed, quality_report = data_loader.validate_data_quality(merged)
         if not passed:
-            logger.warning("数据质量检查存在问题: %s", quality_report.get("issues", []))
+            logger.warning(f"数据质量检查存在问题: {quality_report.get('issues', [])}")
 
         # 保存合并后的原始用于后续复用
         paths.processed.mkdir(parents=True, exist_ok=True)
@@ -235,13 +249,13 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
     else:
         passed, quality_report = data_loader.validate_data_quality(merged)
         if not passed:
-            logger.warning("缓存数据的质量检查存在问题: %s", quality_report.get("issues", []))
+            logger.warning(f"缓存数据的质量检查存在问题: {quality_report.get('issues', [])}")
 
     merged.sort_index(inplace=True)
     merged = data_loader.handle_missing_values(merged)
     passed, quality_report = data_loader.validate_data_quality(merged)
     if not passed:
-        logger.warning("数据质量检查存在问题: %s", quality_report.get("issues", []))
+        logger.warning(f"数据质量检查存在问题: {quality_report.get('issues', [])}")
 
     splitter = DataSplitter(
         train_ratio=config.get("data", {}).get("train_ratio", 0.7),
@@ -257,8 +271,8 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
         try:
             splitter.load_split_info(split_meta_path)
         except Exception as exc:
-            logger.warning("加载划分元信息失败，将重新计算: %s", exc)
-                    else:
+            logger.warning(f"加载划分元信息失败，将重新计算: {exc}")
+    else:
         train_df, val_df, test_df = splitter.split_temporal(merged)
         splitter.save_splits(train_df, val_df, test_df, paths.splits, formats=["parquet"]) 
 
@@ -498,7 +512,7 @@ def evaluate_multi_weather_model(
 
         model.eval()
         pred_collector, target_collector = [], []
-                    with torch.no_grad():
+        with torch.no_grad():
             for batch_features, batch_targets in loader:
                 batch_features = batch_features.to(device)
                 outputs, _ = model(batch_features)

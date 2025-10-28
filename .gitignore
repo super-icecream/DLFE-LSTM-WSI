@@ -19,8 +19,8 @@ venv.bak/
 *.pt
 
 # 数据文件（大文件）
-data/raw/
-data/processed/
+data/
+!data/.gitkeep
 *.csv
 *.xlsx
 *.h5
@@ -29,11 +29,8 @@ data/processed/
 *.pickle
 
 # 实验结果（大文件）
-experiments/checkpoints/
-experiments/logs/*.log
-experiments/results/*.png
-experiments/results/*.pdf
-experiments/runs/
+experiments/
+!experiments/.gitkeep
 
 # 机器学习相关
 mlruns/

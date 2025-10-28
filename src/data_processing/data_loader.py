@@ -10,13 +10,14 @@ import os
 import re
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import logging
 import json
 import yaml
 import torch
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+from pandas.tseries.frequencies import to_offset
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -54,7 +55,13 @@ class DataLoader:
         # 加载配置文件
         if config_path:
             with open(config_path, 'r', encoding='utf-8') as f:
-                self.config = yaml.safe_load(f)
+                full_config = yaml.safe_load(f)
+                # 提取预处理配置
+                preprocessing_config = full_config.get('preprocessing', {})
+                self.config = self._merge_configs(
+                    self._get_default_config(),
+                    preprocessing_config
+                )
         else:
             self.config = self._get_default_config()
 
@@ -68,13 +75,79 @@ class DataLoader:
             Dict: 默认配置字典
         """
         return {
-            'missing_threshold': 0.3,  # 缺失值比例阈值
-            'interpolation_method': 'linear',  # 插值方法
-            'max_consecutive_missing': 6,  # 最大连续缺失数
-            'outlier_detection': True,  # 是否进行异常值检测
-            'outlier_method': 'iqr',  # 异常值检测方法
-            'iqr_threshold': 1.5  # IQR阈值
+            'missing_values': {
+                'strategy': 'interpolation',
+                'method': 'linear',
+                'max_consecutive': 6,
+            },
+            'missing_threshold': 0.3,  # 缺失值比例阈值（向后兼容）
+            'interpolation_method': 'linear',  # 插值方法（向后兼容）
+            'max_consecutive_missing': 6,  # 最大连续缺失数（向后兼容）
+            'outlier_detection': {
+                'method': 'physical',  # 异常值检测方法: 'physical', 'iqr', 'zscore'
+                'iqr_threshold': 1.5,  # IQR阈值（仅在method='iqr'时使用）
+                'apply_to': ['power', 'irradiance', 'temperature', 'pressure', 'humidity'],
+                # 物理约束范围（基于光伏系统和气象学的领域知识）
+                'physical_ranges': {
+                    'power': [0, 55000],  # kW，装机容量50MW + 10%过载保护
+                    'irradiance': [0, 1200],  # W/m²，地面太阳辐照度物理上限
+                    'temperature': [-40, 60],  # °C，极端气候范围
+                    'pressure': [850, 1100],  # hPa，考虑海拔的气压范围
+                    'humidity': [0, 100],  # %，相对湿度的物理范围
+                },
+                # 明确的错误标记值（将被视为缺失值）
+                'error_markers': [-99, -999, -9999],
+            },
+            # 向后兼容的顶层字段
+            'outlier_method': 'physical',
+            'iqr_threshold': 1.5,
+            'physical_ranges': {
+                'power': [0, 55000],
+                'irradiance': [0, 1200],
+                'temperature': [-40, 60],
+                'pressure': [850, 1100],
+                'humidity': [0, 100],
+            },
+            'error_markers': [-99, -999, -9999],
         }
+    
+    def _merge_configs(self, default: Dict, loaded: Dict) -> Dict:
+        """
+        合并默认配置和加载的配置
+        
+        Args:
+            default: 默认配置
+            loaded: 从文件加载的配置
+            
+        Returns:
+            Dict: 合并后的配置
+        """
+        merged = default.copy()
+        
+        # 处理缺失值配置
+        if 'missing_values' in loaded:
+            missing_config = loaded['missing_values']
+            merged['interpolation_method'] = missing_config.get('method', default['interpolation_method'])
+            merged['max_consecutive_missing'] = missing_config.get('max_consecutive', default['max_consecutive_missing'])
+        
+        # 处理异常值检测配置
+        if 'outlier_detection' in loaded:
+            outlier_config = loaded['outlier_detection']
+            merged['outlier_method'] = outlier_config.get('method', default['outlier_method'])
+            merged['iqr_threshold'] = outlier_config.get('iqr_threshold', default['iqr_threshold'])
+            
+            # 合并物理范围
+            if 'physical_ranges' in outlier_config:
+                merged['physical_ranges'] = outlier_config['physical_ranges']
+            
+            # 合并错误标记
+            if 'error_markers' in outlier_config:
+                merged['error_markers'] = outlier_config['error_markers']
+            
+            # 更新嵌套配置
+            merged['outlier_detection'] = outlier_config
+        
+        return merged
 
     def load_single_file(self, file_path: Union[str, Path]) -> pd.DataFrame:
         """
@@ -206,6 +279,22 @@ class DataLoader:
 
         data = data.rename(columns=renamed)
 
+        numeric_candidates = [
+            'power_mw',
+            'power_kwh',
+            'power',
+            'irradiance_total',
+            'dni',
+            'dhi',
+            'temperature',
+            'pressure',
+            'pressure_kpa',
+            'humidity',
+        ]
+        for col in numeric_candidates:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+
         # 功率列统一为kW
         if 'power' not in data.columns and 'power_mw' in data.columns:
             data['power'] = data['power_mw'] * 1000.0
@@ -241,7 +330,12 @@ class DataLoader:
 
         return data
 
-    def load_multi_station(self, station_files: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+    def load_multi_station(
+        self,
+        station_files: Optional[List[str]] = None,
+        merge_method: Optional[str] = None,
+        selected_station: Optional[str] = None,
+    ) -> Dict[str, pd.DataFrame]:
         """
         加载多个站点的数据
 
@@ -253,9 +347,25 @@ class DataLoader:
         """
         station_data = {}
 
-        # 如果未指定文件列表，扫描数据目录
+        # 如果未指定文件列表，扫描数据目录支持 CSV/Excel
         if station_files is None:
-            station_files = list(self.data_path.glob("*.csv"))
+            csv_files = list(self.data_path.glob("*.csv"))
+            excel_files = list(self.data_path.glob("*.xlsx")) + list(self.data_path.glob("*.xls"))
+            station_files = csv_files + excel_files
+
+            target_method = merge_method or self.config.get('merge', {}).get('method')
+            target_station = selected_station or self.config.get('merge', {}).get('selected_station')
+
+            if target_method == 'single' and station_files:
+                if target_station:
+                    matches = [fp for fp in station_files if fp.stem == target_station or fp.name == target_station]
+                    if matches:
+                        station_files = matches[:1]
+                    else:
+                        logger.warning(f"配置的站点 {target_station} 不存在，默认使用第一个站点")
+                        station_files = station_files[:1]
+                else:
+                    station_files = station_files[:1]
         else:
             station_files = [self.data_path / f for f in station_files]
 
@@ -390,56 +500,206 @@ class DataLoader:
         if self.config['outlier_detection']:
             for col in self.required_columns:
                 if col in data.columns and data[col].notna().any():
-                    outliers = self._detect_outliers(data[col].dropna())
-                    report['outliers'][col] = len(outliers)
-                    if len(outliers) > 0:
-                        logger.info(f"列 {col} 检测到 {len(outliers)} 个异常值")
+                    outlier_info = self._detect_outliers(data[col].dropna())
+                    report['outliers'][col] = outlier_info
+                    if outlier_info['count'] > 0:
+                        logger.warning(
+                            f"列 {col} 检测到 {outlier_info['count']} 个异常值 | "
+                            f"方法={outlier_info['method']} | 阈值={outlier_info['thresholds']} | 示例={outlier_info['samples'][:5]}"
+                        )
 
         # 基本统计信息
         report['statistics'] = data[self.required_columns].describe().to_dict()
 
         # 时间连续性检查
-        expected_freq = pd.infer_freq(data.index)
-        if expected_freq != self.freq:
-            logger.warning(f"时间频率不一致，期望: {self.freq}, 实际: {expected_freq}")
+        inferred_freq = pd.infer_freq(data.index)
+        if inferred_freq is None:
+            logger.warning("无法推断时间频率，数据可能存在缺口")
+        else:
+            try:
+                inferred_offset = to_offset(inferred_freq)
+                target_offset = to_offset(self.freq)
+            except ValueError:
+                inferred_offset = None
+                target_offset = None
+
+            if inferred_offset is not None and target_offset is not None:
+                if inferred_offset.nanos == target_offset.nanos:
+                    logger.info(f"检测到数据频率: {inferred_offset.freqstr}")
+                else:
+                    logger.warning(f"时间频率不一致，期望: {target_offset.freqstr}, 实际: {inferred_offset.freqstr}")
+            else:
+                norm_inferred = inferred_freq.replace('minute', 'min').replace('Minute', 'min')
+                norm_target = self.freq.replace('minute', 'min').replace('Minute', 'min')
+                if norm_inferred.lower() == norm_target.lower():
+                    logger.info(f"检测到数据频率: {inferred_freq}")
+                else:
+                    logger.warning(f"时间频率不一致，期望: {self.freq}, 实际: {inferred_freq}")
 
         # 检查时间间隔
         time_diffs = data.index.to_series().diff()
-        irregular_intervals = time_diffs[time_diffs != pd.Timedelta(minutes=15)]
+        try:
+            expected_delta = to_offset(self.freq).delta
+        except ValueError:
+            expected_delta = pd.Timedelta(minutes=self.frequency_minutes)
+        irregular_intervals = time_diffs[time_diffs != expected_delta]
         if len(irregular_intervals) > 1:  # 第一个差值为NaT，忽略
             logger.warning(f"发现 {len(irregular_intervals)-1} 个不规则时间间隔")
 
         return report
 
-    def _detect_outliers(self, series: pd.Series, method: str = None) -> np.ndarray:
+    def _detect_outliers(self, series: pd.Series, method: Optional[str] = None) -> Dict[str, Any]:
         """
         检测异常值
+        
+        支持三种检测方法：
+        1. 'physical': 基于物理约束范围（推荐用于光伏数据）
+        2. 'iqr': 基于四分位距的统计方法
+        3. 'zscore': 基于Z-score的统计方法
 
         Args:
             series: 数据序列
-            method: 检测方法 ('iqr', 'zscore')
+            method: 检测方法 ('physical', 'iqr', 'zscore')
 
         Returns:
-            np.ndarray: 异常值索引
+            Dict: 异常值检测结果，包含索引、数量、阈值等信息
         """
         if method is None:
             method = self.config['outlier_method']
 
-        if method == 'iqr':
+        samples_preview: List[Dict[str, Any]] = []
+        thresholds: Dict[str, Any] = {}
+        column_name = series.name if hasattr(series, 'name') else 'unknown'
+
+        # 方法1：基于物理约束的检测（领域知识驱动）
+        if method == 'physical':
+            # 先检测错误标记值
+            error_markers = self.config.get('error_markers', [-99, -999, -9999])
+            error_mask = series.isin(error_markers)
+            
+            # 检测物理范围外的值
+            physical_ranges = self.config.get('physical_ranges', {})
+            
+            if column_name in physical_ranges:
+                lower_bound, upper_bound = physical_ranges[column_name]
+                range_mask = (series < lower_bound) | (series > upper_bound)
+                outlier_mask = error_mask | range_mask
+            else:
+                # 如果没有定义物理范围，只检测错误标记
+                outlier_mask = error_mask
+                lower_bound, upper_bound = None, None
+            
+            outlier_values = series[outlier_mask]
+            outlier_indices = outlier_values.index
+            
+            # 分类异常值
+            error_marker_count = error_mask.sum()
+            range_violation_count = range_mask.sum() if column_name in physical_ranges else 0
+            
+            if not outlier_values.empty:
+                # 优先显示错误标记
+                error_samples = series[error_mask].head(3) if error_marker_count > 0 else pd.Series()
+                # 然后显示范围违规（取极值）
+                range_samples = series[range_mask if column_name in physical_ranges else pd.Series(dtype=float).index]
+                if not range_samples.empty:
+                    low_samples = range_samples.nsmallest(min(2, len(range_samples)))
+                    high_samples = range_samples.nlargest(min(2, len(range_samples)))
+                    range_samples = pd.concat([low_samples, high_samples])
+                
+                all_samples = pd.concat([error_samples, range_samples]).drop_duplicates()
+                samples_preview = [
+                    {
+                        'timestamp': str(idx),
+                        'value': float(series.loc[idx]),
+                        'reason': 'error_marker' if series.loc[idx] in error_markers else 'out_of_range'
+                    }
+                    for idx in all_samples.index[:5]
+                ]
+            
+            thresholds = {
+                'method': 'physical_constraint',
+                'lower_bound': float(lower_bound) if lower_bound is not None else None,
+                'upper_bound': float(upper_bound) if upper_bound is not None else None,
+                'error_markers': error_markers,
+                'error_marker_count': int(error_marker_count),
+                'range_violation_count': int(range_violation_count),
+            }
+        
+        # 方法2：IQR统计方法（保留用于非物理数据）
+        elif method == 'iqr':
             Q1 = series.quantile(0.25)
             Q3 = series.quantile(0.75)
             IQR = Q3 - Q1
             threshold = self.config['iqr_threshold']
-            outliers = (series < (Q1 - threshold * IQR)) | (series > (Q3 + threshold * IQR))
+            lower_bound = Q1 - threshold * IQR
+            upper_bound = Q3 + threshold * IQR
+            outlier_mask = (series < lower_bound) | (series > upper_bound)
+            outlier_values = series[outlier_mask]
+            outlier_indices = outlier_values.index
+
+            if not outlier_values.empty:
+                low_indices = list(outlier_values.nsmallest(min(3, len(outlier_values))).index)
+                high_indices = list(outlier_values.nlargest(min(3, len(outlier_values))).index)
+                preview_indices = list(dict.fromkeys(low_indices + high_indices))
+                samples_preview = [
+                    {
+                        'timestamp': str(idx),
+                        'value': float(outlier_values.loc[idx]),
+                    }
+                    for idx in preview_indices
+                ]
+
+            thresholds = {
+                'lower_bound': float(lower_bound) if np.isfinite(lower_bound) else None,
+                'upper_bound': float(upper_bound) if np.isfinite(upper_bound) else None,
+                'Q1': float(Q1),
+                'Q3': float(Q3),
+                'IQR': float(IQR),
+                'threshold': float(threshold),
+            }
 
         elif method == 'zscore':
             z_scores = np.abs((series - series.mean()) / series.std())
-            outliers = z_scores > 3
+            outlier_mask = z_scores > 3
+            outlier_values = series[outlier_mask]
+            outlier_indices = outlier_values.index
+
+            if not outlier_values.empty:
+                abs_order = (outlier_values - series.mean()).abs().sort_values(ascending=False)
+                preview_indices = list(abs_order.head(min(5, len(abs_order))).index)
+                samples_preview = [
+                    {
+                        'timestamp': str(idx),
+                        'value': float(outlier_values.loc[idx]),
+                        'zscore': float(z_scores.loc[idx]),
+                    }
+                    for idx in preview_indices
+                ]
+
+            thresholds = {
+                'mean': float(series.mean()),
+                'std': float(series.std()),
+                'zscore_threshold': 3.0,
+            }
 
         else:
             raise ValueError(f"不支持的异常值检测方法: {method}")
 
-        return series[outliers].index
+        outlier_indices = outlier_indices if 'outlier_indices' in locals() else series.index[:0]
+        indices_list = outlier_indices.tolist()
+        extrema = {
+            'min': float(outlier_values.min()) if 'outlier_values' in locals() and not outlier_values.empty else None,
+            'max': float(outlier_values.max()) if 'outlier_values' in locals() and not outlier_values.empty else None,
+        }
+
+        return {
+            'method': method,
+            'indices': indices_list,
+            'count': len(indices_list),
+            'thresholds': thresholds,
+            'samples': samples_preview,
+            'extrema': extrema,
+        }
 
     def handle_missing_values(self, data: pd.DataFrame, method: Optional[str] = None) -> pd.DataFrame:
         """
@@ -494,43 +754,84 @@ class DataLoader:
         """
         quality_report = {
             'pass': True,
-            'issues': []
+            'issues': [],
+            'details': {},
         }
 
         # 检查功率范围
         if 'power' in data.columns:
-            invalid_power = (data['power'] < 0) | (data['power'] > 1000)
-            if invalid_power.any():
+            invalid_mask = (data['power'] < 0) | (data['power'] > 1000)
+            if invalid_mask.any():
                 quality_report['pass'] = False
-                quality_report['issues'].append(f"功率值超出合理范围: {invalid_power.sum()} 个")
+                count = int(invalid_mask.sum())
+                samples = data.loc[invalid_mask, 'power'].sort_values().head(5).tolist()
+                quality_report['issues'].append(f"功率值超出合理范围: {count} 个")
+                quality_report['details']['power'] = {
+                    'count': count,
+                    'samples': samples,
+                    'min': float(data.loc[invalid_mask, 'power'].min()),
+                    'max': float(data.loc[invalid_mask, 'power'].max()),
+                }
 
         # 检查辐照度范围
         if 'irradiance' in data.columns:
-            invalid_irr = (data['irradiance'] < 0) | (data['irradiance'] > 1500)
-            if invalid_irr.any():
+            invalid_mask = (data['irradiance'] < 0) | (data['irradiance'] > 1500)
+            if invalid_mask.any():
                 quality_report['pass'] = False
-                quality_report['issues'].append(f"辐照度超出合理范围: {invalid_irr.sum()} 个")
+                count = int(invalid_mask.sum())
+                samples = data.loc[invalid_mask, 'irradiance'].sort_values().head(5).tolist()
+                quality_report['issues'].append(f"辐照度超出合理范围: {count} 个")
+                quality_report['details']['irradiance'] = {
+                    'count': count,
+                    'samples': samples,
+                    'min': float(data.loc[invalid_mask, 'irradiance'].min()),
+                    'max': float(data.loc[invalid_mask, 'irradiance'].max()),
+                }
 
         # 检查温度范围
         if 'temperature' in data.columns:
-            invalid_temp = (data['temperature'] < -30) | (data['temperature'] > 60)
-            if invalid_temp.any():
+            invalid_mask = (data['temperature'] < -30) | (data['temperature'] > 60)
+            if invalid_mask.any():
                 quality_report['pass'] = False
-                quality_report['issues'].append(f"温度超出合理范围: {invalid_temp.sum()} 个")
+                count = int(invalid_mask.sum())
+                samples = data.loc[invalid_mask, 'temperature'].sort_values().head(5).tolist()
+                quality_report['issues'].append(f"温度超出合理范围: {count} 个")
+                quality_report['details']['temperature'] = {
+                    'count': count,
+                    'samples': samples,
+                    'min': float(data.loc[invalid_mask, 'temperature'].min()),
+                    'max': float(data.loc[invalid_mask, 'temperature'].max()),
+                }
 
         # 检查湿度范围
         if 'humidity' in data.columns:
-            invalid_hum = (data['humidity'] < 0) | (data['humidity'] > 100)
-            if invalid_hum.any():
+            invalid_mask = (data['humidity'] < 0) | (data['humidity'] > 100)
+            if invalid_mask.any():
                 quality_report['pass'] = False
-                quality_report['issues'].append(f"湿度超出合理范围: {invalid_hum.sum()} 个")
+                count = int(invalid_mask.sum())
+                samples = data.loc[invalid_mask, 'humidity'].sort_values().head(5).tolist()
+                quality_report['issues'].append(f"湿度超出合理范围: {count} 个")
+                quality_report['details']['humidity'] = {
+                    'count': count,
+                    'samples': samples,
+                    'min': float(data.loc[invalid_mask, 'humidity'].min()),
+                    'max': float(data.loc[invalid_mask, 'humidity'].max()),
+                }
 
         # 检查气压范围
         if 'pressure' in data.columns:
-            invalid_pre = (data['pressure'] < 800) | (data['pressure'] > 1100)
-            if invalid_pre.any():
+            invalid_mask = (data['pressure'] < 800) | (data['pressure'] > 1100)
+            if invalid_mask.any():
                 quality_report['pass'] = False
-                quality_report['issues'].append(f"气压超出合理范围: {invalid_pre.sum()} 个")
+                count = int(invalid_mask.sum())
+                samples = data.loc[invalid_mask, 'pressure'].sort_values().head(5).tolist()
+                quality_report['issues'].append(f"气压超出合理范围: {count} 个")
+                quality_report['details']['pressure'] = {
+                    'count': count,
+                    'samples': samples,
+                    'min': float(data.loc[invalid_mask, 'pressure'].min()),
+                    'max': float(data.loc[invalid_mask, 'pressure'].max()),
+                }
 
         if quality_report['pass']:
             logger.info("数据质量验证通过")

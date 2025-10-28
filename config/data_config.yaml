@@ -14,6 +14,9 @@ paths:
   processed_data: "./data/processed"
   features_data: "./data/features"
   splits_data: "./data/splits"
+  merge:
+    method: "single"  # 可选: concat / single / average
+    selected_station: "Solar station site 1 (Nominal capacity-50MW)"
 
 # 数据字段定义
 features:
@@ -32,9 +35,18 @@ preprocessing:
     max_consecutive: 6         # 最大连续缺失数
 
   outlier_detection:
-    method: "iqr"              # 异常值检测方法
-    iqr_threshold: 1.5         # IQR阈值
+    method: "physical"         # 异常值检测方法: physical(物理约束)/iqr(统计)/zscore
+    iqr_threshold: 1.5         # IQR阈值（仅在method='iqr'时使用）
     apply_to: ["power", "irradiance", "temperature", "pressure", "humidity"]
+    # 物理约束范围（基于光伏系统和气象学的领域知识）
+    physical_ranges:
+      power: [0, 55000]        # kW，装机容量50MW + 10%过载保护
+      irradiance: [0, 1200]    # W/m²，地面太阳辐照度物理上限
+      temperature: [-40, 60]   # °C，极端气候范围
+      pressure: [850, 1100]    # hPa，考虑海拔1500m的气压范围
+      humidity: [0, 100]       # %，相对湿度的物理范围
+    # 明确的错误标记值（将被视为缺失值，而非异常值）
+    error_markers: [-99, -999, -9999]
 
   normalization:
     method: "minmax"           # 归一化方法
@@ -64,7 +76,7 @@ data_augmentation:
 
 # 数据质量控制
 quality_control:
-  power_range: [0, 1000]      # 功率合理范围 (kW)
+  power_range: [0, 50000]     # 功率合理范围 (kW)
   irradiance_range: [0, 1200] # 辐照度合理范围 (W/m²)
   temperature_range: [-40, 60] # 温度合理范围 (°C)
   pressure_range: [850, 1100] # 气压合理范围 (hPa)

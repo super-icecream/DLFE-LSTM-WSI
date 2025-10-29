@@ -17,6 +17,18 @@ import time
 from scipy.optimize import minimize
 import warnings
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    if torch.cuda.is_available():
+        DEFAULT_DEVICE = "cuda"
+    else:
+        DEFAULT_DEVICE = "cpu"
+except ImportError:
+    torch = None
+    TORCH_AVAILABLE = False
+    DEFAULT_DEVICE = "cpu"
+
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 logger = logging.getLogger(__name__)
@@ -46,7 +58,8 @@ class DPSR:
                  max_iter: int = 100,
                  learning_rate: float = 0.01,
                  sigma_scale: float = 0.5,
-                 max_time_delay: int = 60):
+                 max_time_delay: int = 60,
+                 device: str = "auto"):
         """
         初始化DPSR
 
@@ -82,19 +95,156 @@ class DPSR:
             'accuracy': []
         }
 
+        # Device initialization
+        self.use_gpu = False
+        self.device = "cpu"
+        self._torch = torch if TORCH_AVAILABLE else None
+        self._torch_device = None
+
+        if TORCH_AVAILABLE:
+            selected_device = device
+            if selected_device not in ("auto", "cpu", "cuda"):
+                logger.warning("Unknown device type %s, fallback to auto mode", selected_device)
+                selected_device = "auto"
+
+            if selected_device == "auto":
+                selected_device = DEFAULT_DEVICE
+
+            if selected_device == "cuda" and not torch.cuda.is_available():
+                logger.warning("CUDA not available, DPSR falls back to CPU mode")
+                selected_device = "cpu"
+
+            self.device = selected_device
+            self.use_gpu = self.device == "cuda"
+            self._torch_device = torch.device(self.device)
+
+            if self.use_gpu:
+                try:
+                    device_name = torch.cuda.get_device_name(self._torch_device)
+                except Exception:  # pragma: no cover - driver differences
+                    device_name = "CUDA"
+                logger.info("DPSR enabling GPU execution on %s", device_name)
+            else:
+                logger.info("DPSR running on CPU mode (PyTorch detected, CUDA disabled)")
+        else:
+            if device == "cuda":
+                logger.warning("PyTorch not installed; CUDA mode unavailable, using CPU")
+            logger.info("DPSR running on CPU mode (PyTorch not available)")
+
         logger.info(
             "DPSR初始化: 目标嵌入维度=%s, 邻域大小=%d, 正则化=%.4f",
             str(embedding_dim), self.neighborhood_size, self.regularization
         )
 
-    @staticmethod
-    def _compute_weighted_distances(data: np.ndarray, w_squared: np.ndarray) -> np.ndarray:
-        """计算加权欧氏距离矩阵"""
+    def _compute_weighted_distances(self,
+                                    data: Union[np.ndarray, "torch.Tensor"],
+                                    w_squared: Union[np.ndarray, "torch.Tensor"]):
+        """计算加权欧氏距离矩阵（自动选择CPU/GPU）"""
+        if self.use_gpu and self._torch is not None:
+            torch_module = self._torch
+            data_tensor = data if isinstance(data, torch_module.Tensor) else torch_module.as_tensor(
+                data, dtype=torch_module.float32, device=self._torch_device
+            )
+            weight_tensor = w_squared if isinstance(w_squared, torch_module.Tensor) else torch_module.as_tensor(
+                w_squared, dtype=torch_module.float32, device=self._torch_device
+            )
+
+            diff = data_tensor.unsqueeze(1) - data_tensor.unsqueeze(0)
+            weighted = torch_module.sum(diff * diff * weight_tensor.view(1, 1, -1), dim=2)
+            distances = torch_module.sqrt(torch_module.clamp(weighted, min=0.0))
+            distances.fill_diagonal_(0.0)
+            return distances
+
         diff = data[:, None, :] - data[None, :, :]
         weighted = np.sum(w_squared.reshape(1, 1, -1) * diff ** 2, axis=2)
         distances = np.sqrt(np.maximum(weighted, 0.0))
         np.fill_diagonal(distances, 0.0)
         return distances
+
+    def _objective_gpu(self,
+                       X_tensor: "torch.Tensor",
+                       y_tensor: "torch.Tensor",
+                       weights: np.ndarray) -> float:
+        """使用GPU计算目标函数值。"""
+        torch_module = self._torch
+        w_tensor = torch_module.as_tensor(weights, dtype=torch_module.float32, device=self._torch_device)
+        w_squared = w_tensor.pow(2)
+
+        distances = self._compute_weighted_distances(X_tensor, w_squared)
+        sigma_val = float(self._compute_adaptive_sigma(distances.detach().cpu().numpy()))
+        sigma = torch_module.tensor(sigma_val, device=self._torch_device, dtype=torch_module.float32)
+
+        kernel = torch_module.exp(-distances / sigma)
+        kernel.fill_diagonal_(0.0)
+        row_sums = kernel.sum(dim=1, keepdim=True) + 1e-8
+        probabilities = kernel / row_sums
+
+        y_pred = probabilities @ y_tensor
+        mae = torch_module.mean(torch_module.abs(y_tensor - y_pred))
+        regularization_term = self.regularization * torch_module.sum(w_tensor.pow(2))
+
+        loss = mae + regularization_term
+        return float(loss.item())
+
+    def _gradient_gpu(self,
+                      X_tensor: "torch.Tensor",
+                      y_tensor: "torch.Tensor",
+                      weights: np.ndarray) -> np.ndarray:
+        """使用GPU计算梯度，消除三重嵌套循环。"""
+        torch_module = self._torch
+        n_samples = X_tensor.shape[0]
+
+        w_tensor = torch_module.as_tensor(weights, dtype=torch_module.float32, device=self._torch_device)
+        w_squared = w_tensor.pow(2)
+
+        diff = X_tensor.unsqueeze(1) - X_tensor.unsqueeze(0)
+        diff_sq = diff.pow(2)
+
+        weighted = torch_module.sum(diff_sq * w_squared.view(1, 1, -1), dim=2)
+        distances = torch_module.sqrt(torch_module.clamp(weighted, min=0.0))
+        distances.fill_diagonal_(0.0)
+
+        sigma_val = float(self._compute_adaptive_sigma(distances.detach().cpu().numpy()))
+        sigma = torch_module.tensor(sigma_val, device=self._torch_device, dtype=torch_module.float32)
+
+        kernel = torch_module.exp(-distances / sigma)
+        kernel.fill_diagonal_(0.0)
+
+        row_sums = kernel.sum(dim=1, keepdim=True) + 1e-8
+        probabilities = kernel / row_sums
+        y_pred = probabilities @ y_tensor
+        diff_y = y_tensor - y_pred
+        mae_grad = -torch_module.sign(diff_y)
+
+        dist_safe = torch_module.where(distances <= 1e-10,
+                                       torch_module.ones_like(distances),
+                                       distances)
+
+        weight_view = w_tensor.view(1, 1, -1)
+        kernel_grads = kernel.unsqueeze(-1) * (-weight_view * diff_sq / dist_safe.unsqueeze(-1))
+
+        eye_mask = torch_module.eye(n_samples, device=self._torch_device, dtype=torch_module.bool)
+        kernel_grads = kernel_grads.masked_fill(eye_mask.unsqueeze(-1), 0.0)
+
+        sum_kernel_grads = kernel_grads.sum(dim=1)
+
+        row_sums_inv = 1.0 / row_sums
+        prob_grad = kernel_grads * row_sums_inv
+        prob_grad -= probabilities.unsqueeze(-1) * sum_kernel_grads.unsqueeze(1) * row_sums_inv
+        prob_grad = prob_grad.masked_fill(eye_mask.unsqueeze(-1), 0.0)
+
+        mae_matrix = mae_grad.view(-1, 1, 1)
+        y_matrix = y_tensor.view(1, -1, 1)
+
+        grad_tensor = (mae_matrix * y_matrix * prob_grad).sum(dim=(0, 1)) / n_samples
+        grad_tensor = grad_tensor + 2 * self.regularization * w_tensor
+        grad_tensor = torch_module.clamp(grad_tensor, min=-1e3, max=1e3)
+
+        grad_np = grad_tensor.detach().cpu().numpy()
+        if not np.all(np.isfinite(grad_np)):
+            logger.warning("Gradient contains NaN or Inf in GPU path; zero out gradient")
+            grad_np = np.zeros_like(weights)
+        return grad_np
 
     def _compute_adaptive_sigma(self, distances: np.ndarray) -> float:
         """Return constant kernel width sigma=1.0 (Gu et al., IEEE TSTE 2025)."""
@@ -300,12 +450,22 @@ class DPSR:
         optimization_start_time = time.time()
         iteration_count = 0
         last_loss = None
-        last_grad_norm = None
+
+        torch_module = self._torch if (self.use_gpu and self._torch is not None) else None
+        if torch_module is not None:
+            X_tensor = torch_module.as_tensor(X, dtype=torch_module.float32, device=self._torch_device)
+            y_tensor = torch_module.as_tensor(y_normalized, dtype=torch_module.float32, device=self._torch_device)
+        else:
+            X_tensor = None
+            y_tensor = None
 
         # 定义目标函数
         def objective(w):
             """Objective function with MAE loss (Gu et al., Eq. 11)."""
             w = w.reshape(-1)
+            if torch_module is not None:
+                return self._objective_gpu(X_tensor, y_tensor, w)
+
             w_squared = w ** 2
             distances = self._compute_weighted_distances(X, w_squared)
             sigma = self._compute_adaptive_sigma(distances)
@@ -323,6 +483,9 @@ class DPSR:
         def gradient(w):
             """Gradient of the MAE-based objective (Gu et al., Eq. 12)."""
             w = w.reshape(-1)
+            if torch_module is not None:
+                return self._gradient_gpu(X_tensor, y_tensor, w)
+
             w_squared = w ** 2
             distances = self._compute_weighted_distances(X, w_squared)
             sigma = self._compute_adaptive_sigma(distances)
@@ -382,7 +545,7 @@ class DPSR:
 
         # 优化器迭代回调函数（静默模式，由上层显示进度）
         def callback(xk):
-            nonlocal iteration_count, last_loss, last_grad_norm
+            nonlocal iteration_count, last_loss
             iteration_count += 1
             
             # 只记录，不输出（由上层显示进度）

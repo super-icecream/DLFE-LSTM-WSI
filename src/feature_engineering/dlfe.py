@@ -17,6 +17,18 @@ from scipy.sparse.linalg import eigsh
 from scipy.linalg import eigh
 import warnings
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    if torch.cuda.is_available():
+        DEFAULT_DEVICE = "cuda"
+    else:
+        DEFAULT_DEVICE = "cpu"
+except ImportError:
+    torch = None
+    TORCH_AVAILABLE = False
+    DEFAULT_DEVICE = "cpu"
+
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # 设置日志
@@ -46,7 +58,8 @@ class DLFE:
                  alpha: float = 0.0009765625,
                  beta: float = 0.1,
                  max_iter: int = 100,
-                 tol: float = 1e-6):
+                 tol: float = 1e-6,
+                 device: str = "auto"):
         """
         初始化DLFE
 
@@ -57,6 +70,7 @@ class DLFE:
             beta: ADMM sparsity regularisation parameter (0.1).
             max_iter: ADMM maximum iterations.
             tol: convergence tolerance.
+            device: compute device ('auto', 'cuda', 'cpu').
         """
         self.target_dim = target_dim
         self.sigma = sigma
@@ -64,6 +78,42 @@ class DLFE:
         self.beta = beta
         self.max_iter = max_iter
         self.tol = tol
+
+        # Device management (GPU acceleration path)
+        self.use_gpu = False
+        self.device = "cpu"
+        self._torch = torch if TORCH_AVAILABLE else None
+        self._torch_device = None
+
+        if TORCH_AVAILABLE:
+            selected_device = device
+            if selected_device not in ("auto", "cpu", "cuda"):
+                logger.warning("未知设备类型%s，已回退到自动检测模式", selected_device)
+                selected_device = "auto"
+
+            if selected_device == "auto":
+                selected_device = DEFAULT_DEVICE
+
+            if selected_device == "cuda" and not torch.cuda.is_available():
+                logger.warning("CUDA不可用，DLFE将使用CPU模式执行计算")
+                selected_device = "cpu"
+
+            self.device = selected_device
+            self.use_gpu = selected_device == "cuda"
+            self._torch_device = torch.device(selected_device)
+
+            if self.use_gpu:
+                try:
+                    device_name = torch.cuda.get_device_name(self._torch_device)
+                except Exception:  # pragma: no cover - 驱动实现差异
+                    device_name = "CUDA"
+                logger.info("DLFE启用GPU加速：%s", device_name)
+            else:
+                logger.info("DLFE运行在CPU模式 (PyTorch检测到，但未启用CUDA)")
+        else:
+            if device == "cuda":
+                logger.warning("未安装PyTorch，无法启用CUDA；DLFE将使用CPU模式")
+            logger.info("DLFE运行在CPU模式 (PyTorch不可用)")
 
         # 映射矩阵
         self.mapping_matrix = None  # A矩阵
@@ -97,6 +147,9 @@ class DLFE:
         Returns:
             相似度矩阵Q (n_samples x n_samples)
         """
+        if self.use_gpu and self._torch is not None:
+            return self._build_similarity_matrix_gpu(X, weights, k_neighbors)
+
         n_samples, n_features = X.shape
 
         # 如果提供了权重，进行加权
@@ -150,6 +203,68 @@ class DLFE:
 
         return Q
 
+    def _build_similarity_matrix_gpu(self,
+                                      X: np.ndarray,
+                                      weights: Optional[np.ndarray] = None,
+                                      k_neighbors: Optional[int] = None) -> np.ndarray:
+        """GPU版本相似度矩阵构建，数学上等价于CPU实现。"""
+        if not self.use_gpu or self._torch is None:
+            raise RuntimeError("GPU路径不可用，无法调用_build_similarity_matrix_gpu")
+
+        torch_module = self._torch
+        device = self._torch_device
+        n_samples = X.shape[0]
+        batch_size = min(5000, n_samples)
+        gaussian_denominator = 2.0 * (self.sigma ** 2)
+
+        Q_batches: List[np.ndarray] = []
+
+        with torch_module.no_grad():
+            X_gpu = torch_module.as_tensor(X, dtype=torch_module.double, device=device)
+
+            if weights is not None:
+                if weights.ndim == 1:
+                    weights_gpu = torch_module.as_tensor(weights, dtype=torch_module.double, device=device)
+                    X_weighted = X_gpu * torch_module.sqrt(weights_gpu.view(1, -1))
+                else:
+                    weights_gpu = torch_module.as_tensor(weights, dtype=torch_module.double, device=device)
+                    X_weighted = X_gpu * torch_module.sqrt(weights_gpu)
+            else:
+                X_weighted = X_gpu
+
+            norm_all = torch_module.sum(X_weighted ** 2, dim=1, keepdim=True).T
+
+            for start_idx in range(0, n_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_samples)
+                X_batch = X_weighted[start_idx:end_idx]
+                norm_batch = torch_module.sum(X_batch ** 2, dim=1, keepdim=True)
+
+                distances_sq = norm_batch + norm_all - 2.0 * torch_module.mm(X_batch, X_weighted.T)
+                distances_sq = torch_module.clamp(distances_sq, min=0.0)
+
+                Q_batch = torch_module.exp(-distances_sq / gaussian_denominator)
+
+                if k_neighbors is not None and k_neighbors < n_samples - 1:
+                    threshold = min(k_neighbors + 1, n_samples)
+                    for local_idx in range(end_idx - start_idx):
+                        sorted_indices = torch_module.argsort(distances_sq[local_idx])
+                        keep_indices = sorted_indices[:threshold]
+                        mask = torch_module.zeros(n_samples, dtype=torch_module.bool, device=device)
+                        mask[keep_indices] = True
+                        Q_batch[local_idx, ~mask] = 0.0
+
+                Q_batches.append(Q_batch.cpu().numpy())
+
+                if self.use_gpu:
+                    del X_batch, norm_batch, distances_sq, Q_batch
+                    torch_module.cuda.empty_cache()
+
+        Q = np.vstack(Q_batches)
+        np.fill_diagonal(Q, 0.0)
+        Q = (Q + Q.T) / 2.0
+
+        return Q
+
     def construct_laplacian(self, Q: np.ndarray) -> np.ndarray:
         """
         构建图拉普拉斯矩阵
@@ -163,6 +278,9 @@ class DLFE:
         Returns:
             拉普拉斯矩阵L
         """
+        if self.use_gpu and self._torch is not None:
+            return self._construct_laplacian_gpu(Q)
+
         # 计算度矩阵
         degrees = np.sum(Q, axis=1)
         D = np.diag(degrees)
@@ -184,6 +302,31 @@ class DLFE:
         L_normalized = (L_normalized + L_normalized.T) / 2
 
         return L_normalized
+
+    def _construct_laplacian_gpu(self, Q: np.ndarray) -> np.ndarray:
+        """GPU版本拉普拉斯构建，使用广播代替显式对角矩阵。"""
+        if not self.use_gpu or self._torch is None:
+            raise RuntimeError("GPU路径不可用，无法调用_construct_laplacian_gpu")
+
+        torch_module = self._torch
+        device = self._torch_device
+
+        with torch_module.no_grad():
+            Q_gpu = torch_module.as_tensor(Q, dtype=torch_module.double, device=device)
+            degrees = torch_module.sum(Q_gpu, dim=1)
+
+            L = -Q_gpu
+            diag_idx = torch_module.arange(Q_gpu.shape[0], device=device)
+            L[diag_idx, diag_idx] += degrees
+
+            degrees_sqrt_inv = torch_module.zeros_like(degrees)
+            non_zero_mask = degrees > 1e-10
+            degrees_sqrt_inv[non_zero_mask] = 1.0 / torch_module.sqrt(degrees[non_zero_mask])
+
+            L_normalized = degrees_sqrt_inv.unsqueeze(1) * L * degrees_sqrt_inv.unsqueeze(0)
+            L_normalized = (L_normalized + L_normalized.T) / 2.0
+
+        return L_normalized.cpu().numpy()
 
     def admm_optimization(self,
                          X: np.ndarray,

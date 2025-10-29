@@ -2,7 +2,45 @@
 
 本文档记录DLFE-LSTM-WSI项目的所有重要变更和git id方便回溯。
 
+## [0.5.1] - 2025-10-29 - 特征工程模块 GPU 加速
+- Commit: 8e3a3e5
+
+### 🚀 性能优化
+- **DLFE 模块 GPU 加速** (`src/feature_engineering/dlfe.py`)
+  - 新增 GPU 版本相似度矩阵构建 `_build_similarity_matrix_gpu`
+  - 新增 GPU 版本拉普拉斯矩阵构建 `_construct_laplacian_gpu`
+  - 批处理优化，batch_size=5000
+  - 使用广播代替显式对角矩阵，提升效率
+  - 自动 GPU 内存管理（torch.cuda.empty_cache）
+
+- **DPSR 模块 GPU 加速** (`src/feature_engineering/dpsr.py`)
+  - 新增 GPU 版本目标函数计算 `_objective_gpu`
+  - 新增 GPU 版本梯度计算 `_gradient_gpu`
+  - 消除三重嵌套循环，采用向量化计算
+  - 预计性能提升：10-100x（取决于数据规模和 GPU）
+
+### ✨ 新增功能
+- **自动设备检测机制**
+  - 支持 auto/cuda/cpu 三种设备模式
+  - PyTorch 可用时自动检测 CUDA
+  - 优雅降级策略，无 PyTorch 时自动回退 CPU
+  - 用户无感知的 CPU/GPU 路径切换
+
+### 🔧 技术改进
+- 数值稳定性增强（NaN/Inf 检测与修复）
+- GPU 批处理计算优化
+- 向量化运算替代显式循环
+- 改进内存管理策略
+
+### 📋 修改文件统计
+- 修改文件：3 个
+  - CHANGELOG.md: 补充 v0.5.0 commit hash
+  - src/feature_engineering/dlfe.py: GPU 加速 (+145行)
+  - src/feature_engineering/dpsr.py: GPU 加速 (+175行)
+- 代码变更：+321 行 / -7 行
+
 ## [0.5.0] - 2025-10-29 - Walk-Forward 验证系统
+- Commit: 0be23fd
 
 ### ✨ 新增功能
 - **Walk-Forward 时序验证框架** (`src/data_processing/walk_forward_splitter.py`)

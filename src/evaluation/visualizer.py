@@ -12,6 +12,8 @@ from plotly.subplots import make_subplots
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple, Union
+
+from .metrics import MetricsResult
 import torch
 from datetime import datetime, timedelta
 import warnings

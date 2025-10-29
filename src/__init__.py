@@ -32,6 +32,7 @@ from .data_processing.data_loader import DataLoader
 from .data_processing.data_splitter import DataSplitter
 from .data_processing.preprocessor import Preprocessor
 from .data_processing.vmd_decomposer import VMDDecomposer
+from .data_processing.walk_forward_splitter import WalkForwardSplitter
 from .feature_engineering.weather_classifier import WeatherClassifier
 from .feature_engineering.dpsr import DPSR
 from .feature_engineering.dlfe import DLFE
@@ -39,6 +40,7 @@ from .models.lstm_model import LSTMPredictor
 from .models.model_builder import ModelBuilder
 from .models.multi_weather_model import MultiWeatherModel
 from .training.trainer import GPUOptimizedTrainer
+from .training.walk_forward_trainer import WalkForwardTrainer
 from .training.validator import Validator, MultiModelValidator
 from .training.adaptive_optimizer import AdaptiveOptimizer
 from .evaluation import (
@@ -49,6 +51,8 @@ from .evaluation import (
     export_metrics_bundle,
     export_weather_distribution,
     generate_markdown_report,
+    get_evaluation_config,
+    check_environment,
 )
 from .utils.config_loader import ConfigLoader
 from .utils.logger import get_logger
@@ -61,6 +65,7 @@ __all__ = [
     "DataSplitter",
     "Preprocessor",
     "VMDDecomposer",
+    "WalkForwardSplitter",
     # 特征工程
     "WeatherClassifier",
     "DPSR",
@@ -71,6 +76,7 @@ __all__ = [
     "MultiWeatherModel",
     # 训练与自适应
     "GPUOptimizedTrainer",
+    "WalkForwardTrainer",
     "Validator",
     "MultiModelValidator",
     "AdaptiveOptimizer",

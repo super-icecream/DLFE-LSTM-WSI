@@ -26,24 +26,24 @@ logger = logging.getLogger(__name__)
 
 class DLFE:
     """
-    动态局部特征嵌入 (Dynamic Local Feature Embedding)
+    Dynamic Local Feature Embedding (DLFE)
 
-    基于流形学习的特征降维方法，通过ADMM算法优化保持局部邻域结构。
-    将DPSR的输出降维到30维，同时保持数据的局部几何结构。
+    Manifold-learning dimensionality reduction solved via ADMM while
+    preserving local neighbourhood structure in DPSR outputs.
 
     Attributes:
-        target_dim (int): 目标维度（默认30）
-        sigma (float): 高斯核参数
-        alpha (float): ADMM平衡参数（数据保真度）
-        beta (float): ADMM平衡参数（稀疏性）
-        max_iter (int): ADMM最大迭代次数
-        tol (float): 收敛容差
+        target_dim (int): target embedding dimension (default 30)
+        sigma (float): RBF kernel parameter (fixed 1.0 per Gu et al. 2025)
+        alpha (float): ADMM balance parameter (2^-10 approx 0.00098)
+        beta (float): ADMM regularisation parameter (0.1, sparsity)
+        max_iter (int): ADMM maximum iterations
+        tol (float): convergence tolerance
     """
 
     def __init__(self,
                  target_dim: int = 30,
                  sigma: float = 1.0,
-                 alpha: float = 2**-10,
+                 alpha: float = 0.0009765625,
                  beta: float = 0.1,
                  max_iter: int = 100,
                  tol: float = 1e-6):
@@ -51,12 +51,12 @@ class DLFE:
         初始化DLFE
 
         Args:
-            target_dim: 目标降维维度（30维）
-            sigma: 高斯核宽度参数
-            alpha: ADMM数据保真度参数
-            beta: ADMM稀疏性正则化参数
-            max_iter: ADMM最大迭代次数
-            tol: 收敛容差
+            target_dim: target embedding dimension (30).
+            sigma: RBF kernel width (fixed 1.0 per Gu et al. 2025).
+            alpha: ADMM balance parameter (2^-10 approx 0.00098).
+            beta: ADMM sparsity regularisation parameter (0.1).
+            max_iter: ADMM maximum iterations.
+            tol: convergence tolerance.
         """
         self.target_dim = target_dim
         self.sigma = sigma
@@ -120,6 +120,7 @@ class DLFE:
         distances_squared = np.maximum(distances_squared, 0)
 
         # 计算高斯相似度
+        # sigma fixed to 1.0 (Gu et al., 2025)
         Q = np.exp(-distances_squared / (2 * self.sigma ** 2))
 
         # 如果指定k近邻，只保留k个最近邻

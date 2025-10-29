@@ -19,8 +19,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 from pandas.tseries.frequencies import to_offset
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -503,8 +501,11 @@ class DataLoader:
                     outlier_info = self._detect_outliers(data[col].dropna())
                     report['outliers'][col] = outlier_info
                     if outlier_info['count'] > 0:
-                        logger.warning(
-                            f"列 {col} 检测到 {outlier_info['count']} 个异常值 | "
+                        # 终端：简要信息
+                        print(f"⚠ {col}: 检测到 {outlier_info['count']} 个异常值 (方法: {outlier_info['method']})")
+                        # 日志文件：详细信息
+                        logger.debug(
+                            f"列 {col} 异常值详情 | "
                             f"方法={outlier_info['method']} | 阈值={outlier_info['thresholds']} | 示例={outlier_info['samples'][:5]}"
                         )
 

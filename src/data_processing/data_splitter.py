@@ -15,8 +15,6 @@ from pathlib import Path
 import logging
 from datetime import datetime, timedelta
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 

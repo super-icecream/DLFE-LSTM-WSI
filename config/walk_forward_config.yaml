@@ -1,0 +1,27 @@
+walk_forward:
+  enable: true
+  n_folds: 4
+  fold_definition:
+    fold1:
+      train_months: 12
+      val_months: 1
+      test_months: 2
+    fold2:
+      train_months: 15
+      val_months: 1
+      test_months: 2
+    fold3:
+      train_months: 18
+      val_months: 1
+      test_months: 2
+    fold4:
+      train_months: 21
+      val_months: 1
+      test_months: 2
+  online_learning:
+    enable: true
+    learning_rate_multiplier: 0.1
+    max_updates_per_fold: 100
+  weight_inheritance:
+    enable: true
+    strategy: full

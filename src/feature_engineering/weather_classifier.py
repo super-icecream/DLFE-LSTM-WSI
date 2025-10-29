@@ -14,8 +14,6 @@ import json
 from datetime import datetime
 import math
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 

@@ -31,13 +31,13 @@ class VMDDecomposer:
     Attributes:
         n_modes (int): 模态数量（IMF个数）
         alpha (float): 惩罚参数（控制带宽）
-        tau (float): 噪声容限（0表示无噪声）
+        tau (float): 噪声容限（默认0.1，对偶软约束）
         DC (int): 是否包含直流分量（0或1）
         init (int): 初始化方式（0=全零，1=随机）
         tol (float): 收敛容差
     """
 
-    def __init__(self, n_modes: int = 5, alpha: float = 2000, tau: float = 0,
+    def __init__(self, n_modes: int = 5, alpha: float = 2000, tau: float = 0.1,
                  DC: int = 0, init: int = 1, tol: float = 1e-6, max_iter: int = 500):
         """
         初始化VMD分解器
@@ -45,7 +45,7 @@ class VMDDecomposer:
         Args:
             n_modes: 模态数量，默认5（根据光伏功率特性确定）
             alpha: 惩罚参数，控制数据保真度，默认2000
-            tau: 拉格朗日乘子更新步长，默认0
+            tau: 拉格朗日乘子更新步长，默认0.1
             DC: 是否提取直流分量，默认0
             init: 初始化方式，0=全零，1=随机，默认1
             tol: 收敛容差，默认1e-6
@@ -103,14 +103,19 @@ class VMDDecomposer:
         logger.info(f"开始VMD分解，信号长度: {T}")
 
         # 时域转频域准备
-        t = np.arange(T)
-        fs = 1.0  # 采样频率（归一化）
-        freqs = t - 0.5 - (1 / T) + (1 / T) * np.arange(T) / 2
+        freqs = np.fft.fftfreq(T, d=1.0)
+        half = T // 2
+        pos_slice = slice(0, half + 1)
+        neg_slice = slice(half + 1, None)
+        freqs_pos = freqs[pos_slice]
+        abs_freqs_pos = np.abs(freqs_pos)
 
         # FFT变换到频域
         f_hat = np.fft.fft(signal)
         f_hat_plus = f_hat.copy()
-        f_hat_plus[:T // 2] = 0  # 保留正频率部分
+        f_hat_plus[neg_slice] = 0  # 仅保留非负频率
+        if T % 2 == 0:
+            f_hat_plus[half] = np.real(f_hat_plus[half])
 
         # 初始化
         u_hat_plus = np.zeros((self.n_modes, T), dtype=complex)
@@ -136,6 +141,7 @@ class VMDDecomposer:
         # 开始ADMM优化迭代
         logger.info("开始ADMM迭代优化...")
         n_iter = 0
+        u_hat_plus_prev = u_hat_plus.copy()
 
         for n in range(self.max_iter - 1):
             # 更新模态u
@@ -156,15 +162,19 @@ class VMDDecomposer:
 
                 # Wiener滤波更新
                 numerator = f_hat_plus - sum_uk - lambda_hat / 2
-                denominator = 1 + self.alpha * (freqs - omega[k, n]) ** 2
+                denominator = 1 + self.alpha * (abs_freqs_pos - omega[k, n]) ** 2
+                updated_spectrum = numerator[pos_slice] / denominator
 
-                u_hat_plus[k, :] = numerator / denominator
+                u_hat_plus[k, :] = 0
+                u_hat_plus[k, pos_slice] = updated_spectrum
+                if T % 2 == 0:
+                    u_hat_plus[k, half] = np.real(u_hat_plus[k, half])
 
                 # 处理DC分量
                 if self.DC and k == 0:
-                    # DC模态的特殊处理
-                    w_DC = np.mean(np.abs(u_hat_plus[0, T // 2:T]) ** 2)
-                    u_hat_plus[0, T // 2:T] = u_hat_plus[0, T // 2:T] * np.sqrt(w_DC)
+                    dc_value = np.real(u_hat_plus[0, 0])
+                    u_hat_plus[0, :] = 0
+                    u_hat_plus[0, 0] = dc_value
 
             # 更新中心频率omega
             for k in range(self.n_modes):
@@ -173,9 +183,10 @@ class VMDDecomposer:
                     omega[k, n + 1] = 0
                 else:
                     # 计算频谱重心作为新的中心频率
-                    numerator_omega = np.dot(freqs[T // 2:T],
-                                            np.abs(u_hat_plus[k, T // 2:T]) ** 2)
-                    denominator_omega = np.sum(np.abs(u_hat_plus[k, T // 2:T]) ** 2)
+                    positive_spectrum = u_hat_plus[k, pos_slice]
+                    energy_density = np.abs(positive_spectrum) ** 2
+                    numerator_omega = np.dot(abs_freqs_pos, energy_density)
+                    denominator_omega = np.sum(energy_density)
 
                     if denominator_omega > self.tol:
                         omega[k, n + 1] = numerator_omega / denominator_omega
@@ -187,14 +198,16 @@ class VMDDecomposer:
             lambda_hat += self.tau * (sum_uk - f_hat_plus)
 
             # 收敛性检查
-            conv_check = np.sum(np.abs(u_hat_plus - np.roll(u_hat_plus, -1, axis=1)) ** 2)
-            conv_check = conv_check / T
+            diff = np.sum(np.abs(u_hat_plus - u_hat_plus_prev) ** 2)
+            norm = np.sum(np.abs(u_hat_plus_prev) ** 2)
+            conv_check = diff / (norm + 1e-10)
 
             if conv_check < self.tol:
                 logger.info(f"VMD收敛于第{n + 1}次迭代，误差: {conv_check:.2e}")
                 n_iter = n + 1
                 break
 
+            u_hat_plus_prev = u_hat_plus.copy()
             n_iter = n + 1
 
         # 后处理
@@ -205,10 +218,20 @@ class VMDDecomposer:
         u = np.zeros((self.n_modes, T))
         for k in range(self.n_modes):
             # 构造完整频谱（负频率部分）
+            positive_freqs = u_hat_plus[k, pos_slice]
             u_hat_temp = np.zeros(T, dtype=complex)
-            u_hat_temp[T // 2:T] = u_hat_plus[k, T // 2:T]
-            u_hat_temp[1:T // 2] = np.conj(u_hat_plus[k, T - 1:T // 2:-1])
-            u_hat_temp[0] = np.real(u_hat_plus[k, 0])
+            u_hat_temp[:pos_slice.stop] = positive_freqs
+            u_hat_temp[0] = np.real(u_hat_temp[0])
+
+            if T % 2 == 0:
+                u_hat_temp[half] = np.real(u_hat_temp[half])
+                if half > 1:
+                    mirrored = np.conj(positive_freqs[1:half][::-1])
+                    u_hat_temp[half + 1:] = mirrored
+            else:
+                if half >= 1:
+                    mirrored = np.conj(positive_freqs[1:][::-1])
+                    u_hat_temp[half + 1:] = mirrored
 
             # 逆FFT得到时域信号
             u[k, :] = np.real(np.fft.ifft(u_hat_temp))
@@ -220,6 +243,46 @@ class VMDDecomposer:
         self.u = u
         self.omega = omega_final
         self.is_fitted = True
+
+        # ============================================================
+        # VMD分解质量诊断
+        # ============================================================
+        reconstructed = np.sum(u, axis=0)
+        if np.linalg.norm(signal) > 0:
+            reconstruction_error = np.linalg.norm(signal - reconstructed) / np.linalg.norm(signal)
+        else:
+            reconstruction_error = 0.0
+
+        correlation_matrix = np.corrcoef(u)
+        off_diag_idx = np.triu_indices(self.n_modes, k=1)
+        off_diag_values = correlation_matrix[off_diag_idx]
+        avg_correlation = float(np.mean(np.abs(off_diag_values))) if off_diag_values.size else 0.0
+        max_correlation = float(np.max(np.abs(off_diag_values))) if off_diag_values.size else 0.0
+
+        sorted_omega = np.sort(omega_final)
+        freq_gaps = np.diff(sorted_omega)
+        min_freq_gap = float(np.min(freq_gaps)) if freq_gaps.size else 0.0
+        avg_freq_gap = float(np.mean(freq_gaps)) if freq_gaps.size else 0.0
+
+        energy = np.sum(u ** 2, axis=1)
+        total_energy = float(np.sum(energy))
+        if total_energy > 0:
+            energy_ratio = energy / total_energy
+        else:
+            energy_ratio = np.zeros_like(energy)
+
+        logger.info("=" * 60)
+        logger.info("VMD分解质量诊断")
+        logger.info("=" * 60)
+        logger.info(f"重构误差: {reconstruction_error:.2e}")
+        logger.info(f"模态正交性 - 平均相关系数: {avg_correlation:.3f}, 最大相关系数: {max_correlation:.3f}")
+        logger.info(f"频率分离度 - 最小间隔: {min_freq_gap:.4f}, 平均间隔: {avg_freq_gap:.4f}")
+        logger.info(f"频率分布: {sorted_omega}")
+        logger.info("能量分布:")
+        for idx, ratio in enumerate(energy_ratio):
+            logger.info(f"  IMF{idx + 1}: {ratio:.4f} ({ratio * 100:.2f}%)")
+        logger.info("=" * 60)
+        # ============================================================
 
         logger.info(f"VMD分解完成，各模态中心频率: {omega_final}")
 

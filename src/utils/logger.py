@@ -177,12 +177,13 @@ class ExperimentLogger:
         self.logger = logging.getLogger(name)
         self.logger.setLevel(getattr(logging, log_level.upper()))
         self.logger.handlers.clear()  # 清除已有处理器
+        self.logger.propagate = False  # 不传播到root logger，避免重复输出
         
-        # 控制台处理器（彩色输出）
+        # 控制台处理器（简洁输出）
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(getattr(logging, log_level.upper()))
         console_formatter = ColoredFormatter(
-            '%(asctime)s [%(levelname)s] %(message)s',
+            '%(message)s',  # 只显示消息内容，无时间戳和日志级别前缀
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         console_handler.setFormatter(console_formatter)

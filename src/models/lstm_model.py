@@ -80,8 +80,16 @@ class LSTMPredictor(nn.Module):
 
         # 混合精度的缩放器
         self.scaler = amp.GradScaler() if self.use_mixed_precision else None
+        
+        # 输出GPU优化信息（一次性）
+        if self.use_mixed_precision:
+            logger.info("✓ GPU混合精度训练")
+        elif self.use_cuda:
+            logger.info("✓ GPU训练模式")
+        else:
+            logger.info("✓ CPU训练模式")
 
-    @amp.autocast(enabled=True)  # 自动混合精度装饰器
+    @torch.amp.autocast('cuda', enabled=True)  # 自动混合精度装饰器
     def forward(self, x: torch.Tensor,
                 hidden_states: Optional[Tuple] = None) -> Tuple[torch.Tensor, Tuple]:
         """

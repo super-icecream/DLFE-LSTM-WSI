@@ -19,8 +19,6 @@ import json
 import numpy as np
 from datetime import datetime
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -224,8 +222,9 @@ class GPUOptimizedTrainer:
                 train_results = {}
 
                 for weather_type in self.available_weathers:
-                if weather_type not in train_loaders:
+                    if weather_type not in train_loaders:
                         continue
+
                     with torch.cuda.stream(self.streams[weather_type]):
                         result = self.train_epoch(
                             train_loaders[weather_type],
@@ -386,55 +385,6 @@ class GPUOptimizedTrainer:
                     break
 
         return checkpoint.get('epoch', 0)
-
-
-if __name__ == "__main__":
-    # 测试代码
-    print("GPU优化训练器模块测试")
-
-    # 创建模拟模型
-                        continue
-                    result = self.train_epoch(
-                        train_loaders[weather_type],
-                        weather_type,
-                        epoch + 1
-                    )
-                    train_results[weather_type] = result
-
-            # 验证（如果提供了验证集）
-            if val_loaders:
-                val_results = self.validate_all(val_loaders)
-
-                # 更新最佳模型
-                for weather_type, result in val_results.items():
-                    if result['loss'] < best_metrics[weather_type]['loss']:
-                        best_metrics[weather_type]['loss'] = result['loss']
-                        best_metrics[weather_type]['epoch'] = epoch + 1
-
-                        self.save_checkpoint(
-                            epoch + 1,
-                            {'train': train_results, 'val': val_results},
-                            is_best=True,
-                            model_type=weather_type
-                        )
-
-            # 定期保存检查点
-            if (epoch + 1) % self.config.get('save_interval', 10) == 0:
-                self.save_checkpoint(
-                    epoch + 1,
-                    {'train': train_results, 'val': val_results if val_loaders else None}
-                )
-
-            # 日志记录
-            logger.info(f"训练结果: {train_results}")
-            if val_loaders:
-                logger.info(f"验证结果: {val_results}")
-
-        logger.info("训练完成！")
-        return {
-            'best_metrics': best_metrics,
-            'train_history': self.train_history
-        }
 
     def validate_all(self, val_loaders: Dict[str, DataLoader]) -> Dict:
         """验证所有模型"""

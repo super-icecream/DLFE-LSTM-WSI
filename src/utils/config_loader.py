@@ -132,7 +132,7 @@ class ConfigLoader:
             if not config_path.exists():
                 raise FileNotFoundError(f"配置文件不存在: {config_path}")
         
-        logger.info(f"加载配置文件: {config_path}")
+        print(f"📄 加载配置: {config_path}")
         
         # 根据文件扩展名选择加载器
         if config_path.suffix in ['.yaml', '.yml']:
@@ -266,7 +266,7 @@ class ConfigLoader:
                     f"数据集划分比例之和必须为1.0, 当前: {total_ratio}"
                 )
         
-        logger.info("配置验证通过")
+        # 配置验证通过，无需输出
         return True
     
     def merge_configs(self, 

@@ -54,7 +54,11 @@ __license__ = "MIT"
 # Import core components with error handling
 try:
     from .metrics import MetricsResult, PerformanceMetrics, export_metrics_bundle, export_weather_distribution
-    from .visualizer import PerformanceVisualizer, ModelEvaluator
+    from .visualizer import (
+        PerformanceVisualizer,
+        ModelEvaluator,
+        generate_markdown_report,
+    )
 except ImportError as exc:
     print(f"Warning: evaluation module import failure: {exc}")
     print("Install dependencies: torch numpy pandas scipy matplotlib seaborn plotly")
@@ -67,6 +71,7 @@ __all__ = [
     'PerformanceMetrics',
     'PerformanceVisualizer',
     'ModelEvaluator',
+    'generate_markdown_report',
     'export_metrics_bundle',
     'export_weather_distribution',
     

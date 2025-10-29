@@ -10,7 +10,7 @@ Components:
 """
 
 from .config_loader import ConfigLoader, ConfigSchema
-from .logger import ExperimentLogger, TensorBoardLogger, get_logger
+from .logger import ExperimentLogger, TensorBoardLogger, get_logger as _base_get_logger
 from .checkpoint import CheckpointManager
 
 # 版本信息
@@ -76,6 +76,19 @@ def load_config(config_path: str = './config/config.yaml') -> dict:
 def create_logger(name: str = 'DLFE-LSTM-WSI', **kwargs) -> ExperimentLogger:
     """快速创建日志器"""
     return ExperimentLogger(name=name, **kwargs)
+
+
+def get_logger(name: str = 'DLFE-LSTM-WSI', **kwargs) -> ExperimentLogger:
+    """获取或创建日志器，允许传入 log_dir 等参数"""
+    return _base_get_logger(name=name, **kwargs)
+
+
+def get_logger(name: str = 'DLFE-LSTM-WSI', **kwargs) -> ExperimentLogger:
+    """获取/创建单例日志器，支持传入目录参数"""
+    # 兼容旧参数
+    if 'log_dir' not in kwargs and 'project_dir' in kwargs:
+        kwargs['log_dir'] = kwargs.pop('project_dir')
+    return _get_logger(name=name, **kwargs)
 
 
 def create_checkpoint_manager(checkpoint_dir: str = './experiments/checkpoints',

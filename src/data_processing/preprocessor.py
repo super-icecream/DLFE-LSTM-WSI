@@ -16,8 +16,6 @@ import pickle
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 

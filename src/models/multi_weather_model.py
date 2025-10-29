@@ -41,6 +41,12 @@ class MultiWeatherModel:
         # GPU内存池（避免频繁分配）
         if self.gpu_config['available']:
             self._setup_memory_pool()
+            
+            # 输出GPU优化信息（一次性）
+            if self.use_model_parallel and self.gpu_config['device_count'] >= 3:
+                print(f"✓ 多GPU并行推理已启用")
+            else:
+                print(f"✓ GPU推理已启用")
 
     def _create_models(self) -> Dict[str, nn.Module]:
         """创建GPU优化的模型"""
@@ -53,7 +59,6 @@ class MultiWeatherModel:
                     model = self.model_builder.build_model(weather)
                     model = model.to(f'cuda:{i}')
                     models[weather] = model
-                print(f"{weather}模型部署在GPU {i}")
         else:
             # 所有模型在同一GPU
             for weather in ['sunny', 'cloudy', 'overcast']:
@@ -73,7 +78,7 @@ class MultiWeatherModel:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
-    @torch.cuda.amp.autocast()  # 混合精度推理
+    @torch.amp.autocast('cuda')  # 混合精度推理
     def predict_gpu_optimized(self,
                              features: torch.Tensor,
                              weather_type: Optional[int] = None,

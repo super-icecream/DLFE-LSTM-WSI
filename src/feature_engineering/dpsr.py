@@ -12,14 +12,13 @@ from pathlib import Path
 import logging
 import json
 import pickle
-from scipy.special import softmax
+import sys
+import time
 from scipy.optimize import minimize
 import warnings
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -39,12 +38,15 @@ class DPSR:
     """
 
     def __init__(self,
-                 embedding_dim: int = 30,
-                 neighborhood_size: int = 50,
+                 embedding_dim: Union[int, str] = 30,
+                 embedding_dim_range: Tuple[int, int] = (15, 30),
+                 neighborhood_size: int = 32,
                  regularization: float = 0.01,
-                 time_delay: int = 1,
+                 time_delay: Union[int, str] = 1,
                  max_iter: int = 100,
-                 learning_rate: float = 0.01):
+                 learning_rate: float = 0.01,
+                 sigma_scale: float = 0.5,
+                 max_time_delay: int = 60):
         """
         初始化DPSR
 
@@ -57,11 +59,17 @@ class DPSR:
             learning_rate: 初始学习率
         """
         self.embedding_dim = embedding_dim
-        self.neighborhood_size = neighborhood_size
-        self.regularization = regularization
+        self.embedding_dim_range = embedding_dim_range
+        self.neighborhood_size = int(np.clip(neighborhood_size, 24, 48))
+        self.regularization = float(np.clip(regularization, 0.001, 0.1))
         self.time_delay = time_delay
         self.max_iter = max_iter
         self.learning_rate = learning_rate
+        self.sigma_scale = sigma_scale
+        self.max_time_delay = max_time_delay
+
+        self.actual_embedding_dim: Optional[int] = None
+        self.actual_time_delay: Optional[int] = None
 
         # 动态权重存储
         self.weights = {}  # 每个时间点的权重
@@ -74,7 +82,98 @@ class DPSR:
             'accuracy': []
         }
 
-        logger.info(f"DPSR初始化: 嵌入维度={embedding_dim}, 邻域大小={neighborhood_size}")
+        logger.info(
+            "DPSR初始化: 目标嵌入维度=%s, 邻域大小=%d, 正则化=%.4f",
+            str(embedding_dim), self.neighborhood_size, self.regularization
+        )
+
+    @staticmethod
+    def _compute_weighted_distances(data: np.ndarray, w_squared: np.ndarray) -> np.ndarray:
+        """计算加权欧氏距离矩阵"""
+        diff = data[:, None, :] - data[None, :, :]
+        weighted = np.sum(w_squared.reshape(1, 1, -1) * diff ** 2, axis=2)
+        distances = np.sqrt(np.maximum(weighted, 0.0))
+        np.fill_diagonal(distances, 0.0)
+        return distances
+
+    def _compute_adaptive_sigma(self, distances: np.ndarray) -> float:
+        """Return constant kernel width sigma=1.0 (Gu et al., IEEE TSTE 2025)."""
+        # Reference: Z. Gu et al., Photovoltaic Power Prediction Considering Multifactorial Dynamic Effects,
+        # IEEE Transactions on Sustainable Energy, vol. 16, no. 3, pp. 2197-2209, 2025.
+        return 1.0
+
+    @staticmethod
+    def _average_mutual_information(signal: np.ndarray, lag: int) -> float:
+        """估计平均互信息，采用简单直方图估计"""
+        if lag <= 0 or lag >= len(signal):
+            return np.inf
+
+        x = signal[:-lag]
+        y = signal[lag:]
+        bins = int(np.sqrt(len(x)))
+        histogram_xy, _, _ = np.histogram2d(x, y, bins=bins)
+        histogram_x, _ = np.histogram(x, bins=bins)
+        histogram_y, _ = np.histogram(y, bins=bins)
+
+        pxy = histogram_xy / np.sum(histogram_xy)
+        px = histogram_x / np.sum(histogram_x)
+        py = histogram_y / np.sum(histogram_y)
+
+        px_py = px[:, None] * py[None, :]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(pxy > 0, pxy / (px_py + 1e-12), 1)
+            ami = np.nansum(pxy * np.log(ratio + 1e-12))
+        return ami
+
+    def _determine_time_delay(self, signal: np.ndarray) -> int:
+        """基于平均互信息确定时间延迟τ"""
+        if isinstance(self.time_delay, int):
+            return max(1, min(self.time_delay, self.max_time_delay))
+
+        ami_values = []
+        for lag in range(1, self.max_time_delay + 1):
+            ami = self._average_mutual_information(signal, lag)
+            ami_values.append((lag, ami))
+
+        for idx in range(1, len(ami_values)):
+            if ami_values[idx][1] > ami_values[idx - 1][1]:
+                return ami_values[idx - 1][0]
+
+        return ami_values[-1][0]
+
+    def _determine_embedding_dim(self, signal: np.ndarray) -> int:
+        """使用假近邻法估算嵌入维度"""
+        if isinstance(self.embedding_dim, int):
+            return max(self.embedding_dim_range[0], min(self.embedding_dim, self.embedding_dim_range[1]))
+
+        window = min(200, len(signal) - 1)
+        if window <= 0:
+            return self.embedding_dim_range[0]
+
+        normalized = (signal - np.mean(signal)) / (np.std(signal) + 1e-12)
+        max_dim = self.embedding_dim_range[1]
+        threshold = 0.01
+
+        for m in range(self.embedding_dim_range[0], max_dim + 1):
+            embedded_m = self.phase_space_embedding(normalized, m, self.actual_time_delay or 1)
+            embedded_m1 = self.phase_space_embedding(normalized, m + 1, self.actual_time_delay or 1)
+
+            truncated = min(len(embedded_m), len(embedded_m1))
+            if truncated == 0:
+                continue
+
+            ratios = []
+            for i in range(truncated):
+                diff_m = embedded_m[i] - embedded_m[(i + 1) % truncated]
+                diff_m1 = embedded_m1[i] - embedded_m1[(i + 1) % truncated]
+                denom = np.linalg.norm(diff_m) + 1e-12
+                ratios.append(np.linalg.norm(diff_m1) / denom)
+
+            mean_ratio = np.mean(ratios)
+            if mean_ratio < threshold:
+                return m
+
+        return max_dim
 
     def construct_neighborhood(self,
                              data: np.ndarray,
@@ -154,8 +253,7 @@ class DPSR:
         embedded = np.zeros((n_embedded, m))
 
         for i in range(n_embedded):
-            for j in range(m):
-                embedded[i, j] = signal[i + j * time_delay]
+            embedded[i] = signal[i:i + m * time_delay:time_delay]
 
         return embedded
 
@@ -170,10 +268,10 @@ class DPSR:
         f(w) = (1/n)Σl(yi, ŷi) + λΣwr²
 
         其中预测值：
-        ŷi = Σpij*yj, pij = exp(-dw(si,sj))/Σexp(-dw(si,sk))
+        ŷi = Σpij*yj, pij = exp(-dw(si,sj)^2 / (2σ^2)) / Σexp(-dw(si,sk)^2 / (2σ^2))
 
         加权距离：
-        dw(si,sj) = Σwr²|sir - sjr|
+        dw(si,sj) = sqrt(Σwr² * (sir - sjr)²)
 
         Args:
             X: 特征矩阵 (n_samples x n_features)
@@ -184,10 +282,12 @@ class DPSR:
             优化后的权重向量
         """
         n_samples, n_features = X.shape
+        
+        # 诊断信息
 
         # 初始化权重
         if init_weights is None:
-            weights = np.ones(n_features) / n_features
+            weights = np.full(n_features, 1.0 / n_features)
         else:
             weights = init_weights.copy()
 
@@ -196,117 +296,137 @@ class DPSR:
         y_std = np.std(y) + 1e-8
         y_normalized = (y - y_mean) / y_std
 
+        # 进度跟踪
+        optimization_start_time = time.time()
+        iteration_count = 0
+        last_loss = None
+        last_grad_norm = None
+
         # 定义目标函数
         def objective(w):
-            """NCA目标函数"""
-            # 重塑权重
+            """Objective function with MAE loss (Gu et al., Eq. 11)."""
             w = w.reshape(-1)
             w_squared = w ** 2
-
-            # 计算加权距离矩阵
-            distances = np.zeros((n_samples, n_samples))
-            for i in range(n_samples):
-                for j in range(n_samples):
-                    if i != j:
-                        diff = np.abs(X[i] - X[j])
-                        distances[i, j] = np.sum(w_squared * diff)
-
-            # 计算概率矩阵（softmax）
-            # 避免数值溢出
-            max_dist = np.max(distances, axis=1, keepdims=True)
-            exp_neg_dist = np.exp(-(distances - max_dist))
-
-            # 对角线设为0（不包括自己）
-            np.fill_diagonal(exp_neg_dist, 0)
-
-            # 归一化得到概率
-            row_sums = np.sum(exp_neg_dist, axis=1, keepdims=True) + 1e-10
-            probabilities = exp_neg_dist / row_sums
-
-            # Leave-one-out预测
-            y_pred = np.dot(probabilities, y_normalized)
-
-            # 计算损失
-            prediction_error = np.mean((y_normalized - y_pred) ** 2)
-
-            # 正则化项
+            distances = self._compute_weighted_distances(X, w_squared)
+            sigma = self._compute_adaptive_sigma(distances)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                K = np.exp(-distances / sigma)
+                K = np.maximum(K, 1e-10)
+            np.fill_diagonal(K, 0.0)
+            row_sums = np.sum(K, axis=1, keepdims=True) + 1e-8
+            probabilities = K / row_sums
+            y_pred = probabilities @ y_normalized
+            prediction_error = np.mean(np.abs(y_normalized - y_pred))
             regularization_term = self.regularization * np.sum(w ** 2)
-
-            total_loss = prediction_error + regularization_term
-
-            return total_loss
+            return prediction_error + regularization_term
 
         def gradient(w):
-            """NCA梯度"""
+            """Gradient of the MAE-based objective (Gu et al., Eq. 12)."""
             w = w.reshape(-1)
             w_squared = w ** 2
-            grad = np.zeros_like(w)
+            distances = self._compute_weighted_distances(X, w_squared)
+            sigma = self._compute_adaptive_sigma(distances)
 
-            # 计算加权距离矩阵
-            distances = np.zeros((n_samples, n_samples))
-            for i in range(n_samples):
-                for j in range(n_samples):
-                    if i != j:
-                        diff = np.abs(X[i] - X[j])
-                        distances[i, j] = np.sum(w_squared * diff)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                K = np.exp(-distances / sigma)
+                K = np.maximum(K, 1e-10)
+            np.fill_diagonal(K, 0.0)
 
-            # 计算概率矩阵
-            max_dist = np.max(distances, axis=1, keepdims=True)
-            exp_neg_dist = np.exp(-(distances - max_dist))
-            np.fill_diagonal(exp_neg_dist, 0)
-            row_sums = np.sum(exp_neg_dist, axis=1, keepdims=True) + 1e-10
-            probabilities = exp_neg_dist / row_sums
+            row_sums = np.sum(K, axis=1, keepdims=True) + 1e-8
+            probabilities = K / row_sums
+            y_pred = probabilities @ y_normalized
+            diff_y = y_normalized - y_pred
+            mae_grad = -np.sign(diff_y)
 
-            # Leave-one-out预测
-            y_pred = np.dot(probabilities, y_normalized)
+            grad = np.zeros(n_features)
 
-            # 计算梯度
             for k in range(n_features):
-                grad_k = 0
+                grad_k = 0.0
+
                 for i in range(n_samples):
-                    error_i = y_normalized[i] - y_pred[i]
+                    kernel_grads_i = np.zeros(n_samples)
 
                     for j in range(n_samples):
-                        if i != j:
-                            diff_ij_k = np.abs(X[i, k] - X[j, k])
-                            grad_contrib = probabilities[i, j] * diff_ij_k * \
-                                         (y_normalized[j] - y_pred[i])
-                            grad_k += 2 * w[k] * error_i * grad_contrib
+                        if i == j:
+                            continue
 
-                grad[k] = -2 * grad_k / n_samples + 2 * self.regularization * w[k]
+                        diff_ijk = X[i, k] - X[j, k]
+                        if distances[i, j] > 1e-10:
+                            dist_ij = max(distances[i, j], 1e-10)
+                            kernel_grads_i[j] = K[i, j] * (
+                                -w[k] * (diff_ijk ** 2) / dist_ij
+                            )
+
+                    sum_kernel_grads = np.sum(kernel_grads_i)
+
+                    for j in range(n_samples):
+                        if i == j:
+                            continue
+
+                        prob_grad_ij = (
+                            kernel_grads_i[j] / row_sums[i, 0]
+                            - probabilities[i, j] * sum_kernel_grads / row_sums[i, 0]
+                        )
+
+                        grad_k += mae_grad[i] * y_normalized[j] * prob_grad_ij
+
+                grad[k] = grad_k / n_samples + 2 * self.regularization * w[k]
+
+            grad = np.clip(grad, -1e3, 1e3)
+
+            if np.any(np.isnan(grad)) or np.any(np.isinf(grad)):
+                logger.warning("Gradient contains NaN or Inf; zero out gradient")
+                grad = np.zeros_like(w)
 
             return grad
 
-        # 优化选项
+        # 优化器迭代回调函数（静默模式，由上层显示进度）
+        def callback(xk):
+            nonlocal iteration_count, last_loss, last_grad_norm
+            iteration_count += 1
+            
+            # 只记录，不输出（由上层显示进度）
+            current_loss = objective(xk)
+            last_loss = current_loss
+
+        # Optimization settings
         options = {
             'maxiter': self.max_iter,
-            'gtol': 1e-5,
-            'ftol': 1e-5
+            'gtol': 1e-3,
+            'ftol': 1e-5,
+            'maxls': 30,
+            'disp': False
         }
 
-        # 执行优化
+        # Run optimization (静默模式，由上层显示进度)
         result = minimize(
             objective,
             weights,
             method='L-BFGS-B',
             jac=gradient,
-            bounds=[(0, 1)] * n_features,  # 权重约束在[0,1]
-            options=options
+            bounds=[(0, 1)] * n_features,
+            options=options,
+            callback=callback  # 添加回调
         )
 
-        # 归一化权重
-        optimized_weights = result.x
-        optimized_weights = optimized_weights / (np.sum(optimized_weights) + 1e-10)
-
-        # 记录优化历史
-        self.optimization_history['loss'].append(result.fun)
-
         if result.success:
-            logger.debug(f"NCA优化成功: 损失={result.fun:.4f}, 迭代={result.nit}")
+            optimized_weights = result.x
+            optimized_weights = optimized_weights / (np.sum(optimized_weights) + 1e-10)
         else:
-            logger.warning(f"NCA优化未完全收敛: {result.message}")
+            if np.all(result.x >= 0) and np.sum(result.x) > 0:
+                optimized_weights = result.x / (np.sum(result.x) + 1e-10)
+            else:
+                optimized_weights = np.ones(n_features) / n_features
 
-        return optimized_weights
+        self.optimization_history['loss'].append(result.fun if result.success else np.inf)
+
+        # 返回权重和优化结果（供上层显示进度）
+        return optimized_weights, {
+            'loss': result.fun,
+            'iter': result.nit,
+            'success': result.success,
+            'time': time.time() - optimization_start_time
+        }
 
     def dynamic_reconstruction(self,
                              data: np.ndarray,
@@ -328,8 +448,11 @@ class DPSR:
         n_samples, n_features = data.shape
 
         # 确定每个特征的嵌入维度
-        dim_per_feature = self.embedding_dim // n_features
-        extra_dims = self.embedding_dim % n_features
+        target_dim = self.actual_embedding_dim if self.actual_embedding_dim is not None else (
+            self.embedding_dim if isinstance(self.embedding_dim, int) else self.embedding_dim_range[1]
+        )
+        dim_per_feature = target_dim // n_features
+        extra_dims = target_dim % n_features
 
         # 构建重构矩阵
         reconstructed = []
@@ -345,10 +468,13 @@ class DPSR:
 
             # 相空间嵌入
             if len(feature_series) >= current_dim:
+                time_delay = self.actual_time_delay if self.actual_time_delay is not None else (
+                    self.time_delay if isinstance(self.time_delay, int) else 1
+                )
                 embedded = self.phase_space_embedding(
                     feature_series,
                     embedding_dim=current_dim,
-                    time_delay=self.time_delay
+                    time_delay=time_delay
                 )
             else:
                 # 信号太短，使用重复填充
@@ -370,15 +496,14 @@ class DPSR:
             final_reconstruction = np.hstack(reconstructed_aligned)
 
             # 调整到目标维度
-            if final_reconstruction.shape[1] > self.embedding_dim:
-                final_reconstruction = final_reconstruction[:, :self.embedding_dim]
-            elif final_reconstruction.shape[1] < self.embedding_dim:
-                # 填充到目标维度
+            if final_reconstruction.shape[1] > target_dim:
+                final_reconstruction = final_reconstruction[:, :target_dim]
+            elif final_reconstruction.shape[1] < target_dim:
                 padding = np.zeros((final_reconstruction.shape[0],
-                                   self.embedding_dim - final_reconstruction.shape[1]))
+                                   target_dim - final_reconstruction.shape[1]))
                 final_reconstruction = np.hstack([final_reconstruction, padding])
         else:
-            final_reconstruction = np.zeros((n_samples, self.embedding_dim))
+            final_reconstruction = np.zeros((n_samples, target_dim))
 
         return final_reconstruction
 
@@ -415,20 +540,28 @@ class DPSR:
             labels = np.roll(data_array[:, 0], -1)
             labels[-1] = labels[-2]  # 处理最后一个样本
 
+        base_signal = data_array[:, 0]
+        self.actual_time_delay = self._determine_time_delay(base_signal)
+        self.actual_embedding_dim = self._determine_embedding_dim(base_signal)
+
         # 初始化输出
-        reconstructed_features = np.zeros((n_samples, self.embedding_dim))
+        target_dim = None
+        reconstructed_features = None
         time_weights = {}
 
         # 分批处理，避免内存溢出
         batch_size = min(100, n_samples)
         n_batches = (n_samples + batch_size - 1) // batch_size
+        
+        # 进度跟踪
+        process_start_time = time.time()
+        last_loss = 0.0
+        last_iter = 0
 
         for batch_idx in range(n_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, n_samples)
             batch_indices = np.arange(start_idx, end_idx)
-
-            logger.debug(f"处理批次 {batch_idx + 1}/{n_batches}")
 
             # 对批次中的每个时间点
             for local_idx, global_idx in enumerate(batch_indices):
@@ -443,10 +576,12 @@ class DPSR:
                 # NCA优化学习权重
                 if len(neighborhood_data) >= 3:  # 至少需要3个样本
                     try:
-                        weights = self.nca_optimization(
+                        weights, opt_info = self.nca_optimization(
                             neighborhood_data,
                             neighborhood_labels
                         )
+                        last_loss = opt_info['loss']
+                        last_iter = opt_info['iter']
                     except Exception as e:
                         logger.warning(f"时刻{global_idx}的NCA优化失败: {e}")
                         weights = np.ones(n_features) / n_features
@@ -457,18 +592,39 @@ class DPSR:
                 # 存储权重
                 time_weights[global_idx] = weights
 
-                # 动态重构
-                # 使用当前时刻的数据进行重构
                 current_data = data_array[global_idx:global_idx + 1]
                 reconstructed = self.dynamic_reconstruction(current_data, weights)
 
+                if reconstructed_features is None:
+                    target_dim = reconstructed.shape[1]
+                    reconstructed_features = np.zeros((n_samples, target_dim))
+
                 if reconstructed.shape[0] > 0:
                     reconstructed_features[global_idx] = reconstructed[0]
+                
+                # 单行显示进度（每处理一个样本更新一次）
+                progress_pct = (global_idx + 1) / n_samples * 100
+                elapsed = time.time() - process_start_time
+                eta = elapsed / (global_idx + 1) * (n_samples - global_idx - 1) if global_idx > 0 else 0
+                sys.stdout.write(
+                    f"\rDPSR处理进度: [{global_idx + 1}/{n_samples}] {progress_pct:.1f}% | "
+                    f"loss: {last_loss:.4f} | iter: {last_iter} | "
+                    f"用时: {elapsed:.1f}s | 预计剩余: {eta:.1f}s"
+                )
+                sys.stdout.flush()
+        
+        # 换行
+        print()
 
         # 计算全局平均权重
         self.global_weights = np.mean(list(time_weights.values()), axis=0)
         self.weights = time_weights
         self.is_fitted = True
+        if target_dim is not None:
+            self.actual_embedding_dim = target_dim
+
+        if reconstructed_features is None:
+            reconstructed_features = np.zeros((n_samples, self.actual_embedding_dim or self.embedding_dim_range[1]))
 
         logger.info(f"DPSR完成: 输出形状={reconstructed_features.shape}")
 
@@ -503,7 +659,7 @@ class DPSR:
         if reconstructed_features.shape[0] < n_samples:
             # 填充不足的样本
             padding = np.zeros((n_samples - reconstructed_features.shape[0],
-                               self.embedding_dim))
+                               reconstructed_features.shape[1]))
             reconstructed_features = np.vstack([reconstructed_features, padding])
         elif reconstructed_features.shape[0] > n_samples:
             # 截断多余的样本

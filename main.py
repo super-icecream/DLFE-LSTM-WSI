@@ -15,6 +15,22 @@
 
 from __future__ import annotations
 
+# ========================================
+# 全局日志配置（必须在导入其他模块之前）
+# ========================================
+import logging
+import sys
+
+root_logger = logging.getLogger()
+root_logger.handlers.clear()
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+root_logger.setLevel(logging.INFO)
+# ========================================
+
 import argparse
 import json
 from dataclasses import dataclass
@@ -33,12 +49,14 @@ from src import (
     DataSplitter,
     Preprocessor,
     VMDDecomposer,
+    WalkForwardSplitter,
     WeatherClassifier,
     DPSR,
     DLFE,
     ModelBuilder,
     MultiWeatherModel,
     GPUOptimizedTrainer,
+    WalkForwardTrainer,
     PerformanceMetrics,
     PerformanceVisualizer,
     export_metrics_bundle,
@@ -97,6 +115,20 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="需要评估的运行名称（用于定位检查点和结果目录）",
+    )
+
+    walk_forward_parser = subparsers.add_parser("walk-forward", help="运行 Walk-Forward 验证流程")
+    add_shared_arguments(walk_forward_parser)
+    walk_forward_parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="实验运行名称（默认使用时间戳）",
+    )
+    walk_forward_parser.add_argument(
+        "--disable-online-learning",
+        action="store_true",
+        help="禁用测试阶段的在线学习微调",
     )
 
     return parser.parse_args()
@@ -192,21 +224,26 @@ def sanitize_feature_array(array: np.ndarray) -> np.ndarray:
     return sanitized.astype(np.float32)
 
 
-def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebuild: bool) -> Dict[str, Dict[str, np.ndarray]]:
-    logger.info("开始执行数据预处理与特征工程流水线…")
+def load_or_prepare_merged_dataset(
+    config: Dict,
+    paths: PipelinePaths,
+    logger,
+    force_rebuild: bool,
+):
+    """
+    加载或重新构建合并后的原始数据集，返回DataFrame及DataLoader实例。
+    """
 
     loader_params_path = paths.artifacts / "dataloader_params.json"
     data_loader = PVDataLoader(data_path=str(paths.raw))
-
     loader_meta_path = paths.processed / "merged.metadata.json"
 
     if loader_params_path.exists() and loader_meta_path.exists() and not force_rebuild:
-        logger.info("检测到 DataLoader 参数缓存，尝试加载原始合并数据…")
+        logger.info("检测到 DataLoader 参数缓存，尝试加载原始合并数据。")
         try:
-            # 恢复 DataLoader 的配置状态
             data_loader.load_params(loader_params_path)
             merged = data_loader.load_processed_dataset(paths.processed / "merged.parquet")
-            logger.info("已从缓存加载合并数据与DataLoader配置")
+            logger.info("已从缓存加载合并数据与 DataLoader 配置")
         except Exception as exc:
             logger.warning(f"加载缓存的合并数据失败，将重新执行数据加载: {exc}")
             merged = None
@@ -240,7 +277,6 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
         if not passed:
             logger.warning(f"数据质量检查存在问题: {quality_report.get('issues', [])}")
 
-        # 保存合并后的原始用于后续复用
         paths.processed.mkdir(parents=True, exist_ok=True)
         merged.to_parquet(paths.processed / "merged.parquet")
         data_loader.save_params(loader_params_path)
@@ -256,6 +292,14 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
     passed, quality_report = data_loader.validate_data_quality(merged)
     if not passed:
         logger.warning(f"数据质量检查存在问题: {quality_report.get('issues', [])}")
+
+    return merged, data_loader
+
+
+def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebuild: bool) -> Dict[str, Dict[str, np.ndarray]]:
+    # logger.info("开始执行数据预处理与特征工程流水线…")  # 已移除冗余日志
+
+    merged, _ = load_or_prepare_merged_dataset(config, paths, logger, force_rebuild)
 
     splitter = DataSplitter(
         train_ratio=config.get("data", {}).get("train_ratio", 0.7),
@@ -291,7 +335,7 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
     vmd = VMDDecomposer(
         n_modes=vmd_cfg.get("n_modes", 5),
         alpha=vmd_cfg.get("alpha", 2000),
-        tau=vmd_cfg.get("tau", 0),
+        tau=vmd_cfg.get("tau", 2.0),
         DC=vmd_cfg.get("DC", 0),
         init=vmd_cfg.get("init", 1),
         tol=vmd_cfg.get("tolerance", 1e-6),
@@ -353,7 +397,7 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
         max_iter=dlfe_cfg.get("max_iter", 100),
         tol=dlfe_cfg.get("tol", 1e-6),
     )
-    train_dlfe = dlfe.fit_transform(train_dpsr, dpsr_weights)
+    train_dlfe = dlfe.fit_transform(train_dpsr)
     val_dlfe = dlfe.transform(val_dpsr)
     test_dlfe = dlfe.transform(test_dpsr)
     dlfe.save_mapping(paths.artifacts / "dlfe_mapping.pkl")
@@ -555,6 +599,56 @@ def build_model_builder(config: Dict, input_dim: int, sequence_length: int) -> M
         }
     )
     return builder
+
+
+def run_walk_forward(args: argparse.Namespace, config: Dict, paths: PipelinePaths, logger) -> None:
+    walk_cfg = config.get("walk_forward", {})
+    if not walk_cfg.get("enable", False):
+        logger.error("配置中未启用 walk_forward.enable，无法执行 Walk-Forward 模式")
+        return
+
+    run_name = args.run_name or datetime.now().strftime("walk_%Y%m%d_%H%M%S")
+    if paths.run_dir is None or paths.run_dir.name != run_name:
+        paths = resolve_paths(config, run_name)
+
+    logger.info("启动 Walk-Forward 任务，运行名称：%s", run_name)
+    merged, _ = load_or_prepare_merged_dataset(config, paths, logger, args.force_rebuild)
+
+    splitter = WalkForwardSplitter(config)
+    folds = splitter.create_folds(merged)
+    if not WalkForwardSplitter.validate_folds(folds):
+        raise RuntimeError("Walk-Forward 划分验证失败，请检查配置的时间窗口是否重叠")
+
+    wf_artifact_root = paths.artifacts / "walk_forward"
+    wf_artifact_root.mkdir(parents=True, exist_ok=True)
+    splitter.save_fold_info(folds, wf_artifact_root / "fold_info.json")
+
+    wf_checkpoint_root = paths.checkpoints / "walk_forward"
+    wf_result_root = paths.results / "walk_forward"
+    wf_checkpoint_root.mkdir(parents=True, exist_ok=True)
+    wf_result_root.mkdir(parents=True, exist_ok=True)
+
+    online_override = False if getattr(args, "disable_online_learning", False) else None
+
+    trainer = WalkForwardTrainer(
+        config=config,
+        base_artifact_dir=wf_artifact_root,
+        base_checkpoint_dir=wf_checkpoint_root,
+        base_result_dir=wf_result_root,
+        logger=logger,
+        weather_map=WEATHER_MAP,
+        build_sequence_sets=build_sequence_sets,
+        build_weather_dataloaders=build_weather_dataloaders,
+        evaluate_fn=evaluate_multi_weather_model,
+        build_model_builder=build_model_builder,
+        online_learning_override=online_override,
+    )
+
+    summary = trainer.train_all_folds(folds)
+    aggregate = summary.get("aggregate", {})
+    if aggregate:
+        logger.info("Walk-Forward 聚合指标: %s", json.dumps(aggregate, ensure_ascii=False))
+    logger.info("Walk-Forward 任务完成，结果目录：%s", wf_result_root)
 
 
 def run_train(args: argparse.Namespace, config: Dict, paths: PipelinePaths, logger) -> None:
@@ -759,6 +853,8 @@ def main() -> None:
 
         if args.mode == "prepare":
             run_prepare(args, config, paths, logger)
+        elif args.mode == "walk-forward":
+            run_walk_forward(args, config, paths, logger)
         elif args.mode == "train":
             run_train(args, config, paths, logger)
         elif args.mode == "test":
@@ -774,4 +870,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

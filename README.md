@@ -4,6 +4,8 @@
 
 DLFE-LSTM-WSI是一个基于动态局部特征嵌入和长短期记忆网络的光伏功率预测系统。该系统通过替代昂贵的全天空成像设备，仅使用低成本的气象传感器（气压、湿度等）实现高精度的光伏功率预测。
 
+激活conda环境：conda activate "C:\Users\Administrator\桌面\专利\DLFE-LSTM-WSI\.conda
+
 ## 核心技术
 
 ### 1. 多尺度特征提取架构
@@ -12,16 +14,29 @@ DLFE-LSTM-WSI是一个基于动态局部特征嵌入和长短期记忆网络的�
 - **微观层面**: 基于ADMM算法的动态局部特征嵌入(DLFE)
 
 ### 2. 关键算法
-- **VMD分解**: 变分模态分解，将功率信号分解为5个本征模态函数
+- **VMD分解**: 变分模态分解（ADMM优化），将功率信号分解为5个本征模态函数
+  - 修正：使用绝对频率处理Nyquist分量，tau=0.1适应噪声数据
+  - 质量诊断：重构误差<1e-3，模态正交性，能量分布分析
 - **CI计算**: 清晰度指数，基于天文参数计算太阳辐照度透过率
 - **WSI计算**: 天气状态指数，基于气象参数的综合评估
 - **NCA优化**: 邻域成分分析，学习动态特征权重
-- **ADMM优化**: 交替方向乘子法，实现流形学习降维
+- **DLFE-ADMM**: 交替方向乘子法，实现流形学习降维（特征工程核心）
 
 ### 3. 数据处理流程
 ```
-原始数据(P,I,T,Pre,Hum) → VMD分解(5个IMF) → 双路径天气识别 →
-DPSR重构(30维) → DLFE降维(30维) → LSTM预测 → 多天气子模型融合
+原始数据(P,I,T,Pre,Hum)
+  ↓
+VMD-ADMM分解(5个IMF) [tau=0.1, 绝对频率]
+  ↓
+双路径天气识别(CI+WSI)
+  ↓
+DPSR重构(30维) [NCA优化]
+  ↓
+DLFE降维(30维) [流形学习]
+  ↓
+LSTM预测 + Walk-Forward验证
+  ↓
+多天气子模型融合
 ```
 
 ## 项目结构
@@ -57,8 +72,10 @@ DLFE-LSTM-WSI/
 ### 1. 参数隔离原则
 严格遵循时序数据的参数隔离原则，所有预处理参数仅从训练集学习，防止数据泄露。
 
-### 2. 时序完整性保护
-采用70/20/10的严格时序划分，保持数据的时序连续性和因果关系。
+### 2. 时序完整性保护与Walk-Forward验证
+- **数据划分**：采用4-Fold Walk-Forward策略，训练集从12月逐步扩展到21月
+- **时序严格递增**：测试集/验证集互不重叠，保持因果关系
+- **Online Learning**：在测试阶段进行模型微调，权重继承优化
 
 ### 3. 多天气自适应
 针对晴天、多云、阴天三种天气状态构建专门的子模型，提高预测精度。
@@ -106,9 +123,13 @@ conda activate dlfe-lstm-wsi
 
 4. **运行训练 / 评估**
 ```bash
+# 标准模式（单次训练）
 python main.py prepare --run-name demo
 python main.py train --run-name demo
 python main.py test --run-name demo
+
+# Walk-Forward验证模式（4-Fold渐进验证）
+python main.py train --mode walk-forward --run-name wf_demo
 
 # 或使用脚本包装
 python scripts/prepare_data.py --run-name demo

@@ -12,7 +12,8 @@ from pathlib import Path
 import logging
 import json
 import pickle
-from scipy.sparse import csr_matrix
+import sys
+import time
 from scipy.sparse.linalg import eigsh
 from scipy.linalg import eigh
 import warnings
@@ -59,7 +60,8 @@ class DLFE:
                  beta: float = 0.1,
                  max_iter: int = 100,
                  tol: float = 1e-6,
-                 device: str = "auto"):
+                 device: str = "auto",
+                 use_float32_eigh: bool = True):
         """
         初始化DLFE
 
@@ -71,6 +73,7 @@ class DLFE:
             max_iter: ADMM maximum iterations.
             tol: convergence tolerance.
             device: compute device ('auto', 'cuda', 'cpu').
+            use_float32_eigh: 是否在特征分解阶段使用float32精度以降低显存占用。
         """
         self.target_dim = target_dim
         self.sigma = sigma
@@ -78,6 +81,7 @@ class DLFE:
         self.beta = beta
         self.max_iter = max_iter
         self.tol = tol
+        self.use_float32_eigh = use_float32_eigh
 
         # Device management (GPU acceleration path)
         self.use_gpu = False
@@ -123,6 +127,7 @@ class DLFE:
         self.optimization_history = {
             'objective': [],
             'constraint_violation': [],
+            'relative_change': [],
             'iterations': 0
         }
 
@@ -263,6 +268,13 @@ class DLFE:
         np.fill_diagonal(Q, 0.0)
         Q = (Q + Q.T) / 2.0
 
+        if self.use_gpu:
+            del X_gpu, X_weighted, norm_all
+            if 'weights_gpu' in locals():
+                del weights_gpu
+            if torch_module.cuda.is_available():
+                torch_module.cuda.empty_cache()
+
         return Q
 
     def construct_laplacian(self, Q: np.ndarray) -> np.ndarray:
@@ -310,23 +322,280 @@ class DLFE:
 
         torch_module = self._torch
         device = self._torch_device
+        n_samples = Q.shape[0]
+        chunk_size = min(5000, n_samples)
 
         with torch_module.no_grad():
-            Q_gpu = torch_module.as_tensor(Q, dtype=torch_module.double, device=device)
-            degrees = torch_module.sum(Q_gpu, dim=1)
-
-            L = -Q_gpu
-            diag_idx = torch_module.arange(Q_gpu.shape[0], device=device)
-            L[diag_idx, diag_idx] += degrees
-
+            degrees = torch_module.from_numpy(Q.sum(axis=1)).to(device=device, dtype=torch_module.double)
             degrees_sqrt_inv = torch_module.zeros_like(degrees)
             non_zero_mask = degrees > 1e-10
-            degrees_sqrt_inv[non_zero_mask] = 1.0 / torch_module.sqrt(degrees[non_zero_mask])
+            degrees_sqrt_inv[non_zero_mask] = torch_module.pow(degrees[non_zero_mask], -0.5)
+            col_scale = degrees_sqrt_inv.unsqueeze(0)
 
-            L_normalized = degrees_sqrt_inv.unsqueeze(1) * L * degrees_sqrt_inv.unsqueeze(0)
+            L_normalized_chunks: List[np.ndarray] = []
+
+            for start_idx in range(0, n_samples, chunk_size):
+                end_idx = min(start_idx + chunk_size, n_samples)
+                Q_chunk = torch_module.from_numpy(Q[start_idx:end_idx]).to(device=device, dtype=torch_module.double)
+
+                L_chunk = -Q_chunk
+                row_indices = torch_module.arange(end_idx - start_idx, device=device)
+                col_indices = torch_module.arange(start_idx, end_idx, device=device)
+                L_chunk[row_indices, col_indices] += degrees[start_idx:end_idx]
+
+                row_scale = degrees_sqrt_inv[start_idx:end_idx].unsqueeze(1)
+                L_normalized_chunk = row_scale * L_chunk * col_scale
+
+                L_normalized_chunks.append(L_normalized_chunk.cpu().numpy())
+
+                del Q_chunk, L_chunk, L_normalized_chunk, row_scale, row_indices, col_indices
+                if torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+
+            L_normalized = np.vstack(L_normalized_chunks)
             L_normalized = (L_normalized + L_normalized.T) / 2.0
 
-        return L_normalized.cpu().numpy()
+            del degrees, degrees_sqrt_inv, col_scale, L_normalized_chunks
+            if torch_module.cuda.is_available():
+                torch_module.cuda.empty_cache()
+
+        return L_normalized
+
+    def _admm_optimization_gpu(self,
+                               X: np.ndarray,
+                               L: np.ndarray) -> np.ndarray:
+        """
+        GPU加速版 ADMM 计算，采用分块与稀疏线性算子避免显存暴涨。
+        """
+        if not self.use_gpu or self._torch is None:
+            raise RuntimeError("GPU路径不可用，无法调用_admm_optimization_gpu")
+
+        torch_module = self._torch
+        device = self._torch_device
+
+        n_samples, n_features = X.shape
+        d = self.target_dim
+
+        alpha = self.alpha
+        beta = self.beta
+        tol = self.tol
+        max_iter = self.max_iter
+
+        sample_chunk = min(5000, n_samples)
+
+        # ========== 新增：早停检测函数 ==========
+        def check_early_stopping(iter_idx: int,
+                                 relative_change: float,
+                                 obj_history: List[float],
+                                 rel_history: List[float]) -> Tuple[bool, str]:
+            """智能早停检测"""
+            if relative_change < tol:
+                return True, "F收敛"
+
+            if iter_idx >= 5 and len(obj_history) >= 5:
+                recent = obj_history[-5:]
+                improvement = (recent[0] - recent[-1]) / (abs(recent[0]) + 1e-10)
+                if improvement < 1e-4:
+                    return True, "目标函数停滞"
+
+            if iter_idx >= 3 and len(rel_history) >= 3:
+                if all(history_value < tol * 10 for history_value in rel_history[-3:]):
+                    return True, "F振荡收敛"
+
+            if iter_idx >= 20 and relative_change < tol * 50:
+                return True, "快速收敛"
+
+            return False, ""
+
+        # ========== 新增：进度条更新函数 ==========
+        def update_progress(iter_idx: int,
+                            max_iterations: int,
+                            objective: float,
+                            rel_change: float,
+                            phase: str = "计算中") -> None:
+            """单行进度条更新"""
+            if max_iterations <= 0:
+                progress = 100.0
+                filled = 30
+            else:
+                progress = (iter_idx + 1) / max_iterations * 100
+                filled = min(30, int(30 * (iter_idx + 1) / max_iterations))
+
+            bar = "█" * filled + "░" * (30 - filled)
+            sys.stdout.write(
+                f'\r  ADMM优化 [{bar}] {progress:.1f}% | '
+                f'迭代:{iter_idx + 1}/{max_iterations} | '
+                f'目标值:{objective:.4f} | '
+                f'相对变化:{rel_change:.2e} | '
+                f'{phase}'
+            )
+            sys.stdout.flush()
+
+        logger.info("开始ADMM迭代（早停+进度条）...")
+        start_time = time.time()
+
+        X_gpu = torch_module.as_tensor(X, dtype=torch_module.double, device=device)
+
+        A = torch_module.zeros((n_features, d), dtype=torch_module.double, device=device)
+        F = torch_module.randn((n_samples, d), dtype=torch_module.double, device=device)
+        q, _ = torch_module.linalg.qr(F, mode='reduced')
+        F = q[:, :d]
+
+        XTX = torch_module.zeros((n_features, n_features), dtype=torch_module.double, device=device)
+        for start_idx in range(0, n_samples, sample_chunk):
+            end_idx = min(start_idx + sample_chunk, n_samples)
+            X_chunk = X_gpu[start_idx:end_idx]
+            XTX = XTX + X_chunk.T @ X_chunk
+        XTX_diag = torch_module.diag(XTX) + 1e-10
+
+        optimization_history = {
+            'objective': [],
+            'constraint_violation': [],
+            'relative_change': [],
+            'iterations': 0
+        }
+
+        for iter_idx in range(max_iter):
+            F_old = F.clone()
+
+            phase_label = "特征分解(GPU)" if (self.use_float32_eigh and torch_module.cuda.is_available()) else "特征分解(CPU)"
+
+            update_progress(
+                iter_idx,
+                max_iter,
+                optimization_history['objective'][-1] if optimization_history['objective'] else 0.0,
+                optimization_history['relative_change'][-1] if optimization_history['relative_change'] else 0.0,
+                phase_label
+            )
+
+            if self.use_float32_eigh and torch_module.cuda.is_available():
+                M_gpu = torch_module.from_numpy(L).to(device=device, dtype=torch_module.float32)
+                M_gpu = M_gpu + alpha * torch_module.eye(n_samples, dtype=torch_module.float32, device=device)
+
+                eigenvalues_all, eigenvectors_all = torch_module.linalg.eigh(M_gpu)
+                F = eigenvectors_all[:, :d].to(device=device, dtype=torch_module.double)
+
+                del M_gpu, eigenvalues_all, eigenvectors_all
+                if torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+            else:
+                M_cpu = L + alpha * np.eye(n_samples, dtype=np.float64)
+                eigenvalues, eigenvectors = eigsh(M_cpu, k=d, which='SM')
+                F = torch_module.from_numpy(eigenvectors).to(device=device, dtype=torch_module.double)
+                del M_cpu, eigenvalues, eigenvectors
+
+            if torch_module.count_nonzero(A).item() > 0:
+                XA = torch_module.zeros((n_samples, d), dtype=torch_module.double, device=device)
+                for start_idx in range(0, n_samples, sample_chunk):
+                    end_idx = min(start_idx + sample_chunk, n_samples)
+                    XA[start_idx:end_idx] = X_gpu[start_idx:end_idx] @ A
+                correction = (self.alpha * XA) / (1.0 + self.alpha)
+                F = F + correction
+                q, _ = torch_module.linalg.qr(F, mode='reduced')
+                F = q[:, :d]
+                del XA, correction, q
+                if torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+
+            update_progress(
+                iter_idx,
+                max_iter,
+                optimization_history['objective'][-1] if optimization_history['objective'] else 0.0,
+                optimization_history['relative_change'][-1] if optimization_history['relative_change'] else 0.0,
+                "更新A矩阵"
+            )
+
+            XTF = torch_module.zeros((n_features, d), dtype=torch_module.double, device=device)
+            for start_idx in range(0, n_samples, sample_chunk):
+                end_idx = min(start_idx + sample_chunk, n_samples)
+                X_chunk = X_gpu[start_idx:end_idx]
+                F_chunk = F[start_idx:end_idx]
+                XTF = XTF + X_chunk.T @ F_chunk
+
+            for j in range(d):
+                residual = XTF[:, j] if j == 0 else XTF[:, j] - XTX @ A[:, j]
+
+                norm_residual = torch_module.linalg.norm(residual)
+                threshold = beta / (2 * alpha)
+                if norm_residual > threshold:
+                    shrink = 1 - threshold / (norm_residual + 1e-12)
+                    A[:, j] = shrink * residual / XTX_diag
+                else:
+                    A[:, j].zero_()
+
+            update_progress(
+                iter_idx,
+                max_iter,
+                optimization_history['objective'][-1] if optimization_history['objective'] else 0.0,
+                optimization_history['relative_change'][-1] if optimization_history['relative_change'] else 0.0,
+                "收敛判断"
+            )
+
+            F_change = torch_module.linalg.norm(F - F_old, ord='fro').item()
+            F_reference = torch_module.linalg.norm(F_old, ord='fro').item() + 1e-10
+            relative_change = F_change / F_reference
+
+            trace_term = 0.0
+            laplacian_chunk = min(2048, n_samples)
+            for row_start in range(0, n_samples, laplacian_chunk):
+                row_end = min(row_start + laplacian_chunk, n_samples)
+                L_chunk = torch_module.from_numpy(L[row_start:row_end]).to(device=device, dtype=torch_module.double)
+                LF_chunk = L_chunk @ F
+                trace_term += torch_module.trace(F[row_start:row_end].T @ LF_chunk).item()
+                del L_chunk, LF_chunk
+                if torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+
+            XA_full = torch_module.zeros((n_samples, d), dtype=torch_module.double, device=device)
+            for start_idx in range(0, n_samples, sample_chunk):
+                end_idx = min(start_idx + sample_chunk, n_samples)
+                XA_full[start_idx:end_idx] = X_gpu[start_idx:end_idx] @ A
+
+            reconstruction_term = alpha * (torch_module.linalg.norm(XA_full - F, ord='fro') ** 2).item()
+            regularizer = beta * torch_module.sum(torch_module.linalg.norm(A, dim=0)).item()
+            objective = trace_term + reconstruction_term + regularizer
+
+            optimization_history['objective'].append(objective)
+            optimization_history['constraint_violation'].append(F_change)
+            optimization_history['relative_change'].append(relative_change)
+            optimization_history['iterations'] = iter_idx + 1
+
+            update_progress(iter_idx, max_iter, objective, relative_change, "检查收敛")
+
+            should_stop, reason = check_early_stopping(
+                iter_idx,
+                relative_change,
+                optimization_history['objective'],
+                optimization_history['relative_change']
+            )
+
+            if should_stop:
+                elapsed = time.time() - start_time
+                sys.stdout.write('\n')
+                logger.info(f"  ✅ ADMM提前收敛！原因: {reason}")
+                logger.info(f"     实际迭代: {iter_idx + 1}/{max_iter} | 耗时: {elapsed / 60:.1f}分钟")
+                del XA_full, XTF
+                if torch_module.cuda.is_available():
+                    torch_module.cuda.empty_cache()
+                break
+
+            del XA_full, XTF
+
+            if torch_module.cuda.is_available() and (iter_idx + 1) % 10 == 0:
+                torch_module.cuda.empty_cache()
+        else:
+            elapsed = time.time() - start_time
+            sys.stdout.write('\n')
+            logger.info(f"  ⚠️ ADMM达到最大迭代次数{max_iter}")
+            logger.info(f"     总耗时: {elapsed / 60:.1f}分钟")
+
+        A_cpu = A.detach().cpu().numpy()
+        del X_gpu, A, F, XTX
+        if torch_module.cuda.is_available():
+            torch_module.cuda.empty_cache()
+
+        self.optimization_history = optimization_history
+        return A_cpu
 
     def admm_optimization(self,
                          X: np.ndarray,
@@ -352,6 +621,13 @@ class DLFE:
         """
         n_samples, n_features = X.shape
         d = self.target_dim
+
+        self.optimization_history = {
+            'objective': [],
+            'constraint_violation': [],
+            'relative_change': [],
+            'iterations': 0
+        }
 
         # 初始化
         A = np.zeros((n_features, d))  # 映射矩阵
@@ -431,6 +707,8 @@ class DLFE:
 
             self.optimization_history['objective'].append(obj_value)
             self.optimization_history['constraint_violation'].append(F_change)
+            self.optimization_history['relative_change'].append(relative_change)
+            self.optimization_history['iterations'] = iter_idx + 1
 
             # 日志输出（每10次迭代）
             if (iter_idx + 1) % 10 == 0:
@@ -440,7 +718,6 @@ class DLFE:
             # 收敛判断
             if relative_change < self.tol:
                 logger.info(f"ADMM收敛于第{iter_idx + 1}次迭代")
-                self.optimization_history['iterations'] = iter_idx + 1
                 break
 
         else:
@@ -497,7 +774,12 @@ class DLFE:
 
         # Step 3: ADMM优化
         logger.info("开始ADMM优化...")
-        self.mapping_matrix = self.admm_optimization(X, L)
+        if self.use_gpu and self._torch is not None:
+            logger.info("DLFE使用GPU路径执行ADMM优化")
+            self.mapping_matrix = self._admm_optimization_gpu(X, L)
+        else:
+            logger.info("DLFE使用CPU路径执行ADMM优化")
+            self.mapping_matrix = self.admm_optimization(X, L)
 
         self.is_fitted = True
 

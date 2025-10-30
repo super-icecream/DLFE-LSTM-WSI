@@ -4,30 +4,89 @@ channels:
   - nvidia
   - conda-forge
   - defaults
+
 dependencies:
+  # ==================== Python 环境 ====================
   - python=3.9
-  - numpy>=1.21.0
-  - pandas>=1.3.0
-  - scipy>=1.11.0
-  - scikit-learn>=1.0.0
-  - matplotlib>=3.5.0
-  - seaborn>=0.11.0
-  - pytorch>=1.12
-  - torchvision
-  - torchaudio
-  - cudatoolkit=11.8
-  - pyyaml
-  - tqdm
-  - numba>=0.57
+  
+  # ==================== PyTorch GPU (CUDA 12.4) ====================
+  - pytorch::pytorch>=2.5.0
+  - pytorch::torchvision>=0.20.0
+  - pytorch::torchaudio>=2.5.0
+  - pytorch-cuda=12.4
+  
+  # ==================== 科学计算核心 ====================
+  - numpy>=2.0.0,<2.4.0
+  - pandas>=2.3.0,<2.4.0
+  - scipy>=1.13.0,<1.17.0
+  - scikit-learn>=1.6.0,<1.7.0
+  - numba>=0.57.0
   - statsmodels>=0.14.0
-  - jupyter
-  - tensorboard
-  - pip
+  
+  # ==================== 数据可视化 ====================
+  - matplotlib>=3.9.0,<3.10.0
+  - seaborn>=0.13.0
+  - plotly>=5.0.0
+  
+  # ==================== 深度学习工具 ====================
+  - tensorboard>=2.20.0
+  - jupyter>=1.0.0
+  - jupyterlab>=4.0.0
+  - ipykernel>=6.0.0
+  
+  # ==================== 配置与工具 ====================
+  - pyyaml>=6.0
+  - tqdm>=4.67.0
+  - click>=8.0.0
+  - python-dotenv>=0.20.0
+  
+  # ==================== Conda必需工具 ====================
+  - pip>=25.0.0
+  - setuptools>=80.0.0
+  
+  # ==================== Pip安装的包 ====================
   - pip:
-    - plotly>=5.0.0
-    - optuna>=3.0.0
-    - mlflow>=1.28.0
-    - wandb>=0.13.0
-    - PyWavelets>=1.4.1
-    - python-dotenv>=0.20.0
-    - click>=8.0.0
+      # 机器学习框架
+      - optuna>=4.5.0
+      - mlflow>=3.1.0
+      - wandb>=0.22.0
+      
+      # 信号处理
+      - PyWavelets>=1.6.0
+      
+      # Web框架（MLflow依赖）
+      - fastapi>=0.117.0
+      - uvicorn>=0.37.0
+      - flask>=3.1.0
+      
+      # 数据库与存储
+      - sqlalchemy>=2.0.0
+      - alembic>=1.16.0
+      
+      # 云平台SDK
+      - databricks-sdk>=0.67.0
+      
+      # 监控与日志
+      - sentry-sdk>=2.39.0
+      - colorlog>=6.9.0
+      
+      # 工具库
+      - pydantic>=2.11.0
+      - click>=8.1.0
+      - python-dotenv>=0.20.0
+
+# ==================== 环境说明 ====================
+# 本环境为DLFE-LSTM-WSI项目GPU加速版本
+# 支持平台：Windows (CUDA 12.4), Linux (CUDA 12.4)
+# GPU要求：NVIDIA GPU with Compute Capability >= 7.0
+# 推荐显存：24GB+ (用于混合精度训练)
+# 
+# 安装命令：
+#   conda env create -f environment.yml
+#   conda activate dlfe-lstm-wsi
+# 
+# 更新环境：
+#   conda env update -f environment.yml --prune
+# 
+# GPU验证：
+#   python -c "import torch; print(f'GPU可用: {torch.cuda.is_available()}'); print(f'GPU数量: {torch.cuda.device_count()}'); print(f'GPU型号: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"无\"}')"

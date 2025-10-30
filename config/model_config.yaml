@@ -25,9 +25,9 @@ multi_weather_models:
     weather_condition: "clear"
     specialized_features: true
 
-  partly_cloudy:               # 部分多云子模型
-    model_id: "partly_cloudy_lstm"
-    weather_condition: "partly_cloudy"
+  cloudy:                      # 多云子模型
+    model_id: "cloudy_lstm"
+    weather_condition: "cloudy"
     specialized_features: true
 
   overcast:                    # 阴天子模型

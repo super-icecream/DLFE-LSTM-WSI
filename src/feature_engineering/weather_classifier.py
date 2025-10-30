@@ -76,7 +76,7 @@ class WeatherClassifier:
         # 天气类别定义
         self.weather_types = {
             0: 'sunny',      # 晴天
-            1: 'partly_cloudy',  # 部分多云
+            1: 'cloudy',     # 多云
             2: 'overcast'    # 阴天
         }
 

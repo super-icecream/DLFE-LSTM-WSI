@@ -22,8 +22,14 @@ from pathlib import Path
 
 warnings.filterwarnings('ignore')
 
-# 设置中文字体支持
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 黑体
+# 设置中文字体支持（尝试多个字体，按优先级）
+plt.rcParams['font.sans-serif'] = [
+    'WenQuanYi Zen Hei',  # 文泉驿正黑
+    'WenQuanYi Micro Hei',  # 文泉驿微米黑
+    'Noto Sans CJK SC',  # Noto中文字体
+    'SimHei',  # 黑体（Windows）
+    'DejaVu Sans'  # 备用西文字体
+]
 plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 # 设置Seaborn风格
@@ -42,7 +48,7 @@ class PerformanceVisualizer:
     """
     
     def __init__(self, 
-                 style: str = 'seaborn',
+                 style: str = 'seaborn-v0_8-whitegrid',
                  figsize: Tuple[int, int] = (12, 8),
                  dpi: int = 100,
                  chinese_font: bool = True):
@@ -50,14 +56,18 @@ class PerformanceVisualizer:
         初始化可视化器
         
         Args:
-            style: 绘图风格
+            style: 绘图风格（支持 matplotlib 内置样式）
             figsize: 默认图表大小
             dpi: 图像分辨率
             chinese_font: 是否使用中文字体
         """
-        plt.style.use(style)
+        self._set_plot_style(style)
         self.figsize = figsize
         self.dpi = dpi
+        
+        # 验证中文字体是否可用
+        if chinese_font:
+            self._verify_chinese_font()
         
         # 配色方案
         self.colors = {
@@ -68,6 +78,82 @@ class PerformanceVisualizer:
             'danger': '#C73E1D',
             'info': '#6C969D'
         }
+    
+    def _set_plot_style(self, style: str):
+        """
+        设置绘图样式，支持自动降级
+        
+        Args:
+            style: 期望的绘图样式
+        """
+        try:
+            plt.style.use(style)
+            return
+        except OSError:
+            pass
+
+        fallback_styles = [
+            'seaborn-v0_8-whitegrid',
+            'seaborn-v0_8',
+            'ggplot',
+            'bmh',
+            'fivethirtyeight',
+            'tableau-colorblind10',
+            'default',
+        ]
+
+        for fallback in fallback_styles:
+            try:
+                plt.style.use(fallback)
+                warnings.warn(
+                    f"样式 '{style}' 不可用，已降级使用 '{fallback}'",
+                    UserWarning,
+                )
+                return
+            except OSError:
+                continue
+
+        warnings.warn(
+            f"所有样式设置失败，使用 matplotlib 默认样式",
+            UserWarning,
+        )
+    
+    def _verify_chinese_font(self):
+        """
+        验证中文字体是否可用，如果不可用则提供安装建议
+        """
+        import matplotlib.font_manager as fm
+        import logging
+        
+        # 获取所有可用字体
+        available_fonts = [f.name for f in fm.fontManager.ttflist]
+        
+        # 检查是否有可用的中文字体
+        chinese_fonts = [
+            'WenQuanYi Zen Hei',
+            'WenQuanYi Micro Hei',
+            'Noto Sans CJK SC',
+            'SimHei',
+            'Microsoft YaHei'
+        ]
+        
+        has_chinese_font = any(font in available_fonts for font in chinese_fonts)
+        
+        if not has_chinese_font:
+            warnings.warn(
+                "未检测到可用的中文字体！图表中的中文可能显示为方块。\n"
+                "建议执行以下命令安装中文字体：\n"
+                "  apt-get update && apt-get install -y fonts-wqy-zenhei\n"
+                "安装后需要清除matplotlib字体缓存：\n"
+                "  rm -rf ~/.cache/matplotlib",
+                UserWarning
+            )
+        else:
+            # 找到第一个可用的中文字体
+            used_font = next((f for f in chinese_fonts if f in available_fonts), None)
+            if used_font:
+                logger = logging.getLogger(__name__)
+                logger.info(f"✓ 使用中文字体: {used_font}")
         
     def plot_prediction_comparison(self,
                                   predictions: np.ndarray,

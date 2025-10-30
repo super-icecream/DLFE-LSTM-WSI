@@ -32,6 +32,7 @@ root_logger.setLevel(logging.INFO)
 # ========================================
 
 import argparse
+import gc
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -388,6 +389,14 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
     test_dpsr = dpsr.transform(test_vmd)
     dpsr.save_weights(paths.artifacts / "dpsr_weights.pkl")
 
+    # Clear GPU cache after DPSR to avoid OOM during DLFE.
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved = torch.cuda.memory_reserved() / 1024 ** 3
+        logger.info("✓ DPSR后清理GPU - 已分配: %.2f GB, 已保留: %.2f GB", allocated, reserved)
+
     dlfe_cfg = fe_cfg.get("dlfe", {})
     dlfe = DLFE(
         target_dim=dlfe_cfg.get("target_dim", 30),
@@ -395,7 +404,9 @@ def run_feature_pipeline(config: Dict, paths: PipelinePaths, logger, force_rebui
         alpha=dlfe_cfg.get("alpha", 2 ** -10),
         beta=dlfe_cfg.get("beta", 0.1),
         max_iter=dlfe_cfg.get("max_iter", 100),
-        tol=dlfe_cfg.get("tol", 1e-6),
+        tol=dlfe_cfg.get("tol", 1e-5),
+        use_float32_eigh=dlfe_cfg.get("use_float32_eigh", False),
+        use_sparse_matrix=dlfe_cfg.get("use_sparse_matrix", True),
     )
     train_dlfe = dlfe.fit_transform(train_dpsr)
     val_dlfe = dlfe.transform(val_dpsr)
@@ -427,6 +438,8 @@ def prepare_feature_sets(config: Dict, paths: PipelinePaths, logger, force_rebui
     splits = ["train", "val", "test"]
     cached = {} if force_rebuild else {split: load_cached_feature_split(paths.features, split) for split in splits}
     if not force_rebuild and all(cached.get(split) for split in splits):
+        # Highlight reused cache in orange and log the event.
+        print("\033[38;5;214m⚠️  检测到缓存的特征文件，直接加载（跳过DPSR和DLFE特征工程）\033[0m")
         logger.info("检测到缓存的特征文件，直接加载")
         return cached  # type: ignore
 

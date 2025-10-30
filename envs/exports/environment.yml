@@ -42,6 +42,9 @@ dependencies:
   - tqdm
   - click
   - python-dotenv
+  
+  # 数据格式支持
+  - openpyxl>=3.0.0
 
   # pip安装的专用包
   - pip

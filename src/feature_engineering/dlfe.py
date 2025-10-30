@@ -37,6 +37,78 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
+def diagnose_matrix_sparsity(matrix: np.ndarray, name: str = "Matrix") -> Dict:
+    """
+    Diagnose matrix sparsity and estimate memory impact.
+
+    Args:
+        matrix: Matrix to inspect.
+        name: Matrix name for logging.
+
+    Returns:
+        Dictionary containing diagnostic metrics.
+    """
+    n, m = matrix.shape
+    total_elements = n * m
+
+    nonzero_mask = np.abs(matrix) > 1e-10
+    nonzero_elements = np.count_nonzero(nonzero_mask)
+
+    sparsity = 1.0 - (nonzero_elements / total_elements)
+
+    dense_memory_gb = (total_elements * 8) / (1024 ** 3)
+    sparse_memory_mb = (nonzero_elements * 12) / (1024 ** 2)
+
+    savings_ratio = (dense_memory_gb * 1024) / sparse_memory_mb if sparse_memory_mb > 0 else float("inf")
+
+    nonzero_per_row = np.sum(nonzero_mask, axis=1)
+    avg_nonzero_per_row = float(np.mean(nonzero_per_row))
+    max_nonzero_per_row = int(np.max(nonzero_per_row))
+    min_nonzero_per_row = int(np.min(nonzero_per_row))
+
+    result = {
+        "shape": (n, m),
+        "total_elements": int(total_elements),
+        "nonzero_elements": int(nonzero_elements),
+        "sparsity": float(sparsity),
+        "avg_nonzero_per_row": avg_nonzero_per_row,
+        "max_nonzero_per_row": max_nonzero_per_row,
+        "min_nonzero_per_row": min_nonzero_per_row,
+        "dense_memory_gb": float(dense_memory_gb),
+        "sparse_memory_mb": float(sparse_memory_mb),
+        "savings_ratio": float(savings_ratio),
+    }
+
+    diag_logger = logging.getLogger(__name__)
+    diag_logger.info("=" * 70)
+    diag_logger.info(f"📊 {name} 稀疏性诊断报告")
+    diag_logger.info("=" * 70)
+    diag_logger.info(f"矩阵形状: {n} × {m}")
+    diag_logger.info(f"总元素数: {total_elements:,}")
+    diag_logger.info(f"非零元素: {nonzero_elements:,}")
+    diag_logger.info(f"稀疏度: {sparsity * 100:.2f}%")
+    diag_logger.info(f"每行非零元素: 平均={avg_nonzero_per_row:.1f}, 最大={max_nonzero_per_row}, 最小={min_nonzero_per_row}")
+    diag_logger.info("")
+    diag_logger.info("💾 内存占用估算:")
+    diag_logger.info(f"  密集存储 (float64): {dense_memory_gb:.2f} GB")
+    diag_logger.info(f"  稀疏存储 (COO):     {sparse_memory_mb:.2f} MB")
+    diag_logger.info(f"  节省比例:           {savings_ratio:.1f}x")
+    diag_logger.info("")
+
+    should_use_sparse = sparsity > 0.9 and dense_memory_gb > 1.0
+    if should_use_sparse:
+        diag_logger.info("✅ 推荐使用稀疏矩阵优化！")
+        diag_logger.info(f"   理由: 稀疏度={sparsity * 100:.1f}%, 密集存储需要={dense_memory_gb:.2f}GB")
+    else:
+        diag_logger.info("⚠️  稀疏矩阵优化收益不明显")
+        diag_logger.info(f"   理由: 稀疏度={sparsity * 100:.1f}%, 密集存储仅需={dense_memory_gb:.2f}GB")
+
+    diag_logger.info("=" * 70)
+
+    result["should_use_sparse"] = should_use_sparse
+    return result
+
+
 class DLFE:
     """
     Dynamic Local Feature Embedding (DLFE)
@@ -59,9 +131,10 @@ class DLFE:
                  alpha: float = 0.0009765625,
                  beta: float = 0.1,
                  max_iter: int = 100,
-                 tol: float = 1e-6,
+                 tol: float = 1e-5,
                  device: str = "auto",
-                 use_float32_eigh: bool = True):
+                 use_float32_eigh: bool = False,
+                 use_sparse_matrix: bool = True):
         """
         初始化DLFE
 
@@ -73,7 +146,8 @@ class DLFE:
             max_iter: ADMM maximum iterations.
             tol: convergence tolerance.
             device: compute device ('auto', 'cuda', 'cpu').
-            use_float32_eigh: 是否在特征分解阶段使用float32精度以降低显存占用。
+            use_float32_eigh: 是否启用 GPU 特征分解（lobpcg），大型稀疏矩阵时可能触发 OOM。
+            use_sparse_matrix: 是否启用稀疏矩阵优化（CPU eigsh），稀疏度>95%时推荐。
         """
         self.target_dim = target_dim
         self.sigma = sigma
@@ -82,6 +156,7 @@ class DLFE:
         self.max_iter = max_iter
         self.tol = tol
         self.use_float32_eigh = use_float32_eigh
+        self.use_sparse_matrix = use_sparse_matrix
 
         # Device management (GPU acceleration path)
         self.use_gpu = False
@@ -130,6 +205,7 @@ class DLFE:
             'relative_change': [],
             'iterations': 0
         }
+        self._sparsity_diagnosis: Optional[Dict] = None
 
         logger.info(f"DLFE初始化: 目标维度={target_dim}, σ={sigma}, α={alpha}, β={beta}")
 
@@ -458,7 +534,12 @@ class DLFE:
         for iter_idx in range(max_iter):
             F_old = F.clone()
 
-            phase_label = "特征分解(GPU)" if (self.use_float32_eigh and torch_module.cuda.is_available()) else "特征分解(CPU)"
+            if self.use_sparse_matrix:
+                phase_label = "特征分解(CPU-稀疏)"
+            elif self.use_float32_eigh and torch_module.cuda.is_available():
+                phase_label = "特征分解(GPU-lobpcg)"
+            else:
+                phase_label = "特征分解(CPU)"
 
             update_progress(
                 iter_idx,
@@ -468,16 +549,97 @@ class DLFE:
                 phase_label
             )
 
-            if self.use_float32_eigh and torch_module.cuda.is_available():
-                M_gpu = torch_module.from_numpy(L).to(device=device, dtype=torch_module.float32)
-                M_gpu = M_gpu + alpha * torch_module.eye(n_samples, dtype=torch_module.float32, device=device)
+            if self.use_sparse_matrix:
+                try:
+                    if iter_idx == 0:
+                        logger.info(f"使用稀疏特征分解（CPU eigsh）计算 {d} 个最小特征值...")
 
-                eigenvalues_all, eigenvectors_all = torch_module.linalg.eigh(M_gpu)
-                F = eigenvectors_all[:, :d].to(device=device, dtype=torch_module.double)
+                    from scipy.sparse import csr_matrix
+                    import scipy.sparse
 
-                del M_gpu, eigenvalues_all, eigenvectors_all
-                if torch_module.cuda.is_available():
-                    torch_module.cuda.empty_cache()
+                    L_sparse = csr_matrix(L)
+                    M_sparse = L_sparse + alpha * scipy.sparse.eye(n_samples, format="csr")
+
+                    eigenvalues, eigenvectors = eigsh(
+                        M_sparse,
+                        k=d,
+                        which="SM",
+                        maxiter=1000,
+                        tol=1e-6,
+                    )
+
+                    F = torch_module.from_numpy(eigenvectors).to(device=device, dtype=torch_module.float64)
+                    if iter_idx == 0:
+                        print("✓ 稀疏特征分解（CPU eigsh）完成，结果已传输到 GPU", flush=True)
+
+                    del L_sparse, M_sparse, eigenvalues, eigenvectors
+
+                except Exception as e:
+                    if iter_idx == 0:
+                        logger.warning(f"稀疏特征分解失败: {type(e).__name__}: {e}")
+                        logger.info("回退到 CPU 密集特征分解...")
+
+                    M_cpu = L + alpha * np.eye(n_samples, dtype=np.float64)
+                    eigenvalues, eigenvectors = eigsh(M_cpu, k=d, which='SM')
+                    F = torch_module.from_numpy(eigenvectors).to(device=device, dtype=torch_module.double)
+                    del M_cpu, eigenvalues, eigenvectors
+                    if iter_idx == 0:
+                        logger.info("CPU eigsh 执行成功")
+
+            elif self.use_float32_eigh and torch_module.cuda.is_available():
+                try:
+                    logger.info(f"尝试使用 GPU lobpcg 计算 {d} 个最小特征值...")
+
+                    M_gpu = torch_module.from_numpy(L).to(device=device, dtype=torch_module.float64)
+                    M_gpu = M_gpu + alpha * torch_module.eye(n_samples, dtype=torch_module.float64, device=device)
+
+                    if torch_module.isnan(M_gpu).any() or torch_module.isinf(M_gpu).any():
+                        raise ValueError("M_gpu 包含 NaN 或 Inf，无法进行特征分解")
+
+                    eigenvalues, eigenvectors = torch_module.lobpcg(
+                        M_gpu,
+                        k=d,
+                        largest=False,
+                        niter=300,
+                        tol=1e-6,
+                        method='ortho'
+                    )
+
+                    if eigenvectors.shape[1] < d:
+                        raise RuntimeError(f"lobpcg 只收敛了 {eigenvectors.shape[1]}/{d} 个特征向量")
+
+                    orth_check = eigenvectors.T @ eigenvectors
+                    orth_error = torch_module.norm(
+                        orth_check - torch_module.eye(d, dtype=torch_module.float64, device=device)
+                    ).item()
+
+                    if orth_error > 1e-3:
+                        logger.warning(f"GPU lobpcg 正交性误差: {orth_error:.2e}")
+                    else:
+                        logger.debug(f"GPU lobpcg 正交性验证通过: {orth_error:.2e}")
+
+                    F = eigenvectors
+                    logger.info(f"GPU lobpcg 成功，正交性误差: {orth_error:.2e}")
+
+                    del M_gpu, eigenvalues
+                    if torch_module.cuda.is_available():
+                        torch_module.cuda.empty_cache()
+
+                except Exception as e:
+                    logger.warning(f"GPU lobpcg 失败: {type(e).__name__}: {e}")
+                    logger.info("回退到 CPU eigsh 方法...")
+
+                    if 'M_gpu' in locals():
+                        del M_gpu
+                    if torch_module.cuda.is_available():
+                        torch_module.cuda.empty_cache()
+
+                    M_cpu = L + alpha * np.eye(n_samples, dtype=np.float64)
+                    eigenvalues, eigenvectors = eigsh(M_cpu, k=d, which='SM')
+                    F = torch_module.from_numpy(eigenvectors).to(device=device, dtype=torch_module.double)
+                    del M_cpu, eigenvalues, eigenvectors
+                    logger.info("CPU eigsh 执行成功")
+
             else:
                 M_cpu = L + alpha * np.eye(n_samples, dtype=np.float64)
                 eigenvalues, eigenvectors = eigsh(M_cpu, k=d, which='SM')
@@ -771,6 +933,31 @@ class DLFE:
         # Step 2: 构建拉普拉斯矩阵
         logger.info("构建拉普拉斯矩阵...")
         L = self.construct_laplacian(Q)
+
+        # ========== 诊断矩阵稀疏性 ==========
+        logger.info("\n开始诊断矩阵稀疏性...")
+        Q_diagnosis = diagnose_matrix_sparsity(Q, "相似度矩阵 Q")
+        L_diagnosis = diagnose_matrix_sparsity(L, "拉普拉斯矩阵 L")
+        self._sparsity_diagnosis = {
+            "Q": Q_diagnosis,
+            "L": L_diagnosis,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if L_diagnosis["should_use_sparse"]:
+            logger.warning("⚠️  检测到拉普拉斯矩阵L高度稀疏！")
+            logger.warning("    当前将使用密集矩阵（需要 %.2f GB GPU显存）", L_diagnosis["dense_memory_gb"])
+            logger.warning("    建议启用稀疏矩阵优化（仅需 %.2f MB）", L_diagnosis["sparse_memory_mb"])
+            logger.warning("    可节省 %.1fx 内存！", L_diagnosis["savings_ratio"])
+
+        # Clear GPU cache after matrix construction to avoid OOM in ADMM.
+        if self.use_gpu and self._torch is not None:
+            import gc
+
+            gc.collect()
+            if self._torch.cuda.is_available():
+                self._torch.cuda.empty_cache()
+                allocated = self._torch.cuda.memory_allocated() / 1024 ** 3
+                logger.info("✓ 矩阵构建后清理GPU - 已分配: %.2f GB", allocated)
 
         # Step 3: ADMM优化
         logger.info("开始ADMM优化...")

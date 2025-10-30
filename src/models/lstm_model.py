@@ -14,6 +14,10 @@ import torch.nn as nn
 import torch.cuda.amp as amp
 from typing import Tuple, Optional, Union
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+_GPU_MODE_LOGGED = False
 
 
 class LSTMPredictor(nn.Module):
@@ -81,13 +85,16 @@ class LSTMPredictor(nn.Module):
         # 混合精度的缩放器
         self.scaler = amp.GradScaler() if self.use_mixed_precision else None
         
-        # 输出GPU优化信息（一次性）
-        if self.use_mixed_precision:
-            logger.info("✓ GPU混合精度训练")
-        elif self.use_cuda:
-            logger.info("✓ GPU训练模式")
-        else:
-            logger.info("✓ CPU训练模式")
+        # 输出GPU优化信息（全局仅一次）
+        global _GPU_MODE_LOGGED
+        if not _GPU_MODE_LOGGED:
+            if self.use_mixed_precision:
+                logger.info("✓ GPU混合精度训练")
+            elif self.use_cuda:
+                logger.info("✓ GPU训练模式")
+            else:
+                logger.info("✓ CPU训练模式")
+            _GPU_MODE_LOGGED = True
 
     @torch.amp.autocast('cuda', enabled=True)  # 自动混合精度装饰器
     def forward(self, x: torch.Tensor,

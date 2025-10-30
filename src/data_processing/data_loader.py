@@ -36,15 +36,14 @@ class DataLoader:
         config (dict): 配置参数
     """
 
-    def __init__(self, data_path: str = "./data/raw", config_path: Optional[str] = None):
+    def __init__(self, data_path: Optional[str] = None, config_path: Optional[str] = None):
         """
         初始化数据加载器
 
         Args:
-            data_path (str): 原始数据文件路径
-            config_path (str, optional): 配置文件路径
+            data_path: 数据路径，默认从配置文件读取 `data.raw_dir`
+            config_path: 配置文件路径，用于覆盖预处理参数
         """
-        self.data_path = Path(data_path)
         self.required_columns = ['power', 'irradiance', 'temperature', 'pressure', 'humidity']
         self.freq = '15T'  # 15分钟采样频率
         self.station_column = 'station'
@@ -62,6 +61,9 @@ class DataLoader:
                 )
         else:
             self.config = self._get_default_config()
+
+        resolved_data_path = data_path or self._resolve_default_data_path(config_path)
+        self.data_path = Path(resolved_data_path)
 
         logger.info(f"数据加载器初始化完成，数据路径: {self.data_path}")
 
@@ -146,6 +148,38 @@ class DataLoader:
             merged['outlier_detection'] = outlier_config
         
         return merged
+
+    def _resolve_default_data_path(self, config_path: Optional[str]) -> str:
+        """
+        从配置文件中解析数据路径，默认回退到 ./data/raw
+
+        Args:
+            config_path: 显式传入的配置文件路径
+
+        Returns:
+            str: 数据目录路径
+        """
+        candidates: List[Path] = []
+        if config_path:
+            candidates.append(Path(config_path))
+        candidates.append(Path("config/config.yaml"))
+
+        for candidate in candidates:
+            if candidate is None or not candidate.exists():
+                continue
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    config_data = yaml.safe_load(f) or {}
+            except Exception as exc:  # pragma: no cover - 容错日志
+                logger.debug("读取配置文件%s获取data.raw_dir失败: %s", candidate, exc)
+                continue
+
+            raw_dir = config_data.get('data', {}).get('raw_dir')
+            if raw_dir:
+                return raw_dir
+
+        logger.debug("未在配置文件中找到 data.raw_dir，使用默认路径 ./data/raw")
+        return "./data/raw"
 
     def load_single_file(self, file_path: Union[str, Path]) -> pd.DataFrame:
         """

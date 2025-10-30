@@ -10,7 +10,7 @@ dataset:
 
 # 数据路径配置
 paths:
-  raw_data: "C:/Users/Administrator/桌面/专利/data/2. 甘肃光伏功率预测数据集/data_original/solar_stations"
+  raw_data: "./datas/2. 甘肃光伏功率预测数据集/data_original/solar_stations"
   processed_data: "./data/processed"
   features_data: "./data/features"
   splits_data: "./data/splits"

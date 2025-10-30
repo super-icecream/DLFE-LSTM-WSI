@@ -10,7 +10,7 @@ project:
 
 data:
   dataset: "甘肃光伏功率预测数据集"
-  raw_dir: "C:/Users/Administrator/桌面/专利/data/2. 甘肃光伏功率预测数据集/data_original/solar_stations"
+  raw_dir: "./datas/2. 甘肃光伏功率预测数据集/data_original/solar_stations"
   merge_method: "single"
   train_ratio: 0.7
   val_ratio: 0.2

@@ -58,10 +58,17 @@ DLFE-LSTM-WSI/
 │   ├── training/          # 训练模块
 │   └── evaluation/        # 评估模块
 ├── tests/                 # 测试代码
-├── data/                  # 数据目录
-│   ├── raw/              # 原始数据
+├── data/                  # 处理数据目录
 │   ├── processed/        # 处理后数据
-│   └── results/          # 结果输出
+│   ├── features/         # 特征数据
+│   ├── splits/           # 数据划分
+│   └── cache/            # 缓存文件
+├── datas/                 # 原始数据集目录
+│   ├── 1. 河北光伏功率预测数据/
+│   ├── 2. 甘肃光伏功率预测数据/
+│   ├── 3. 澳大利亚气象和光伏数据集/
+│   ├── 4. 光伏模组功率预测数据/
+│   └── 5. 内蒙古光伏或风电数据/
 ├── experiments/           # 实验记录
 ├── docs/                 # 文档
 └── scripts/              # 脚本工具
@@ -107,7 +114,7 @@ conda activate dlfe-lstm-wsi
 
 2. **数据准备**
 
-- 原始“甘肃光伏功率预测数据集”位于 `C:/Users/Administrator/桌面/专利/data/2. 甘肃光伏功率预测数据集/data_original/solar_stations`
+- 原始“甘肃光伏功率预测数据集”位于 `./datas/2. 甘肃光伏功率预测数据集/data_original/solar_stations`
 - DataLoader 已支持 `.xlsx/.xls`，会自动识别 `Time(year-month-day h:m:s)` 为 `timestamp`
 - 关键列自动重命名：
   - `Global horizontal irradiance (W/m2)` → `irradiance`
@@ -116,7 +123,8 @@ conda activate dlfe-lstm-wsi
   - `Relative humidity (%)` → `humidity`
   - `Power (MW)` → `power`（自动转化为 kW）
 - 其余列仍保留，可按需在特征工程阶段使用
-- 如果换用其它目录，可在 `config/config.yaml` 或命令行参数中覆盖 `data.raw_dir`
+- 原始数据集存放在 `datas/` 目录，处理后数据存放于 `data/` 目录
+- 如果换用其它数据集，可在 `config/config.yaml` 或命令行参数中覆盖 `data.raw_dir`
 
 3. **配置修改**
 根据实际需求修改 `config/` 目录下的配置文件

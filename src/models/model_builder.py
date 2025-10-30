@@ -47,8 +47,8 @@ class ModelBuilder:
                 'hidden_dims': [100, 50],
                 'dropout_rates': [0.3, 0.2],
                 'output_dim': 1,
-                'sequence_length': 24,
-                'batch_size': 64
+                'sequence_length': 24
+                # batch_size 交由 DataLoader 管理
             }
         else:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -130,8 +130,18 @@ class ModelBuilder:
             'device_id': self.device.index if self.device.type == 'cuda' else 0
         })
 
-        # 创建模型
-        model = LSTMPredictor(**self.config)
+        # 创建模型（过滤掉与模型无关的训练参数）
+        lstm_params = {
+            'input_dim': self.config.get('input_dim', 30),
+            'hidden_dims': self.config.get('hidden_dims') or self.config.get('hidden_sizes', [100, 50]),
+            'dropout_rates': self.config.get('dropout_rates', [0.3, 0.2]),
+            'output_dim': self.config.get('output_dim', 1),
+            'sequence_length': self.config.get('sequence_length', 24),
+            'use_cuda': self.config.get('use_cuda', True),
+            'use_mixed_precision': self.config.get('use_mixed_precision', True),
+            'device_id': self.config.get('device_id', 0),
+        }
+        model = LSTMPredictor(**lstm_params)
 
         # 权重初始化（GPU优化）
         self._initialize_weights_gpu(model)

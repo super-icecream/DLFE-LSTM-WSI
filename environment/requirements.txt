@@ -62,6 +62,9 @@ databricks-sdk>=0.67.0
 sentry-sdk>=2.39.0
 colorlog>=6.9.0
 
+# ==================== 数据格式支持 ====================
+openpyxl>=3.0.0  # Excel文件读写支持（pandas读取.xlsx需要）
+
 # ==================== 工具库 ====================
 pydantic>=2.11.0
 python-dateutil>=2.9.0

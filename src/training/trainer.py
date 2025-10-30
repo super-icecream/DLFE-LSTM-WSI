@@ -12,7 +12,7 @@ import torch.cuda.amp as amp
 from torch.utils.data import DataLoader
 from typing import Dict, Optional, Tuple, List
 import logging
-from tqdm import tqdm
+import sys
 import os
 from pathlib import Path
 import json
@@ -122,10 +122,7 @@ class GPUOptimizedTrainer:
         epoch_loss = 0
         num_batches = 0
 
-        # 创建进度条
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch} - {weather_type}")
-
-        for batch_idx, batch in enumerate(pbar):
+        for batch_idx, batch in enumerate(train_loader):
             if isinstance(batch, (list, tuple)) and len(batch) == 3:
                 features, targets, _ = batch
             else:
@@ -179,9 +176,6 @@ class GPUOptimizedTrainer:
             epoch_loss += loss.item() * self.accumulation_steps
             num_batches += 1
 
-            # 更新进度条
-            pbar.set_postfix({'loss': epoch_loss / num_batches})
-
             # 定期清理GPU缓存
             if self.device.type == 'cuda' and batch_idx % 100 == 0:
                 torch.cuda.empty_cache()
@@ -215,7 +209,7 @@ class GPUOptimizedTrainer:
         }
 
         for epoch in range(epochs):
-            logger.info(f"========== Epoch {epoch+1}/{epochs} ==========")
+            val_results: Dict[str, Dict[str, float]] = {}
 
             if self.streams and torch.cuda.is_available():
                 # GPU并行训练
@@ -273,11 +267,28 @@ class GPUOptimizedTrainer:
                     {'train': train_results, 'val': val_results if val_loaders else None}
                 )
 
-            # 日志记录
-            logger.info(f"训练结果: {train_results}")
+            # 日志记录（调试级别，仅写入日志）
+            logger.debug(f"训练结果: {train_results}")
             if val_loaders:
-                logger.info(f"验证结果: {val_results}")
+                logger.debug(f"验证结果: {val_results}")
 
+            # 单行刷新训练进度
+            progress_percent = (epoch + 1) / epochs * 100
+            train_loss_str = ", ".join(
+                f"{weather}: {metrics['loss']:.4f}"
+                for weather, metrics in train_results.items()
+            ) if train_results else "无数据"
+            val_loss_str = ", ".join(
+                f"{weather}: {metrics['loss']:.4f}"
+                for weather, metrics in val_results.items()
+            ) if val_results else "N/A"
+            sys.stdout.write(
+                f"\r训练进度: {epoch + 1}/{epochs} ({progress_percent:.1f}%) | "
+                f"训练损失: [{train_loss_str}] | 验证损失: [{val_loss_str}]"
+            )
+            sys.stdout.flush()
+
+        print()
         logger.info("训练完成！")
         return {
             'best_metrics': best_metrics,

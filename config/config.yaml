@@ -77,6 +77,10 @@ feature_engineering:
     sigma: 1.0
     alpha: 0.0009765625
     beta: 0.1
+    max_iter: 100
+    tol: 1.0e-5
+    use_float32_eigh: false
+    use_sparse_matrix: true
 
 model:
   lstm:

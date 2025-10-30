@@ -28,6 +28,15 @@ data/
 *.pkl
 *.pickle
 
+# 原始数据集目录（除甘肃数据集外）
+datas/1. 河北光伏功率预测数据集/
+datas/3. 澳大利亚气象和光伏数据集/
+datas/4. 光伏模组功率预测数据集/
+datas/5. 内蒙古光伏或风电数据/
+
+# 保留甘肃数据集（已提交到仓库）
+!datas/2. 甘肃光伏功率预测数据集/
+
 # 实验结果（大文件）
 experiments/
 !experiments/.gitkeep

@@ -73,6 +73,9 @@ envs/locks/
 *.temp
 *.log
 
+# 工作笔记（不纳入版本控制）
+下一步方案暂存.md
+
 # 构建文件
 build/
 dist/

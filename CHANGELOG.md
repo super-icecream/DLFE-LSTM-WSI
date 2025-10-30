@@ -3,7 +3,7 @@
 本文档记录DLFE-LSTM-WSI项目的所有重要变更和git id方便回溯。
 
 ## [0.5.2] - 2025-10-30 - DLFE ADMM 优化增强
-- Commit: fca01ae
+- Commit: 45473eb
 
 ### 🚀 性能优化
 - **ADMM GPU 算法完整实现** (`src/feature_engineering/dlfe.py`)

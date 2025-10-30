@@ -3,7 +3,7 @@
 本文档记录DLFE-LSTM-WSI项目的所有重要变更和git id方便回溯。
 
 ## [0.5.4] - 2025-10-30 - 环境依赖全面升级
-- Commit: 9ddb081
+- Commit: c34213c
 
 ### 🚀 PyTorch 升级
 - **PyTorch 2.5.0+ (CUDA 12.4)** (`environment/environment.yml`, `environment/requirements.txt`)

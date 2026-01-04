@@ -152,7 +152,7 @@ def main():
             if intra_day_discontinuous == 0:
                 print("[drop 诊断] 每天内部白天行连续，按天分组后滑窗不会触发时间不连续")
         else:
-            # mask 模式：保留所有行，滑窗时检查
+            # mask 模式：保留所有行，滑窗时检查锚点是否为白天
             df_for_split = daylight_result.df
             print(f"\n[mask 模式] 保留所有行，滑窗时检查锚点是否为白天")
     else:

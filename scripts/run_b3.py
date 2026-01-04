@@ -526,7 +526,7 @@ def main():
             df_for_split = filtered_df
         else:
             df_for_split = daylight_result.df
-            print(f"\n[mask 模式] 保留所有行")
+            print(f"\n[mask 模式] 保留所有行，滑窗时检查锚点是否为白天")
     
     # =========================================================================
     # 4. 按天切分

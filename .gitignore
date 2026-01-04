@@ -18,8 +18,13 @@ venv/
 .idea/
 
 # 实验输出
-experiments/runs/
+experiments
 diagnostics/
 
 # 日志
 *.log
+
+#文档
+docs/
+
+
